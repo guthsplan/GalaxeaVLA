@@ -36,6 +36,10 @@ except ImportError:
     except ImportError:
         pass
 
+if __import__("os").environ.get("G05_DISABLE_FLASH_ATTN") == "1":  # sm_120 (RTX PRO 6000) cannot build FA4 CuTe kernels
+    _flash_attn_varlen = None
+    _flash_attn_backend = None
+
 _VISION_FLASH_ATTN_WARNED = False
 
 logger = logging.getLogger(__name__)

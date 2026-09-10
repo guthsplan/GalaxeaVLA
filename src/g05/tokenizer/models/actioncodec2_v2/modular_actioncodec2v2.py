@@ -36,6 +36,8 @@ try:
 except ImportError:
     _FLASH_AVAILABLE = False
     flash_attn_func = None
+if __import__("os").environ.get("G05_DISABLE_FLASH_ATTN") == "1":
+    flash_attn_func = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

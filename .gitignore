@@ -177,3 +177,5 @@ checkpoints/
 /dataset_stats_*.json
 # local-only setup scratch notes (may contain machine-specific/internal paths)
 ENV_SETUP_NOTES.md
+# symlinked checkpoint dir (trailing-slash rule above does not match symlinks)
+/checkpoints
