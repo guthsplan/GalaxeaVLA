@@ -36,10 +36,11 @@ chunk beginning at `t`. Sparse sources are resolved **causally**::
 `source_frame > t` is never selected — a belief state from the future would leak
 the answer. Episode boundaries are never crossed. Two modes:
 
-* ``snapshot`` (belief, bgcond) — the row is an observation at instant `s`, so
+* ``snapshot`` (bg_known, bg_belief, bg_observe) — the row is an observation at
+  instant `s`, so
   reusing it at `t > s` is genuinely stale. `--max-staleness-frames` bounds it;
   frames past the bound get no label rather than a wrong one.
-* ``segment`` (subtask, delta, effect) — the row *defines* the segment it opens,
+* ``segment`` (subtask, bg_delta, bg_effect) — the row *defines* the segment it opens,
   which runs to the next annotated frame (or the episode end). Filling that
   segment is exact, not stale, so the staleness bound does not apply.
 
@@ -84,10 +85,11 @@ SEGMENT = "segment"
 
 LABEL_FIELDS: Tuple[Tuple[str, str, str], ...] = (
     ("subtask", "atomic_task_index", SEGMENT),
-    ("belief", "belief_index", SNAPSHOT),
-    ("delta", "delta_index", SEGMENT),
-    ("effect", "effect_index", SEGMENT),
-    ("bgcond", "bgcond_index", SNAPSHOT),
+    ("bg_known", "bg_known_index", SNAPSHOT),
+    ("bg_belief", "bg_belief_index", SNAPSHOT),
+    ("bg_delta", "bg_delta_index", SEGMENT),
+    ("bg_effect", "bg_effect_index", SEGMENT),
+    ("bg_observe", "bg_observe_index", SNAPSHOT),
     ("bbox", "bbox_index", SEGMENT),
     ("trace_2d", "2d_trace_index", SEGMENT),
 )
@@ -98,12 +100,21 @@ FRAME_EXACT = {"bbox", "trace_2d"}
 #: prefix (see behavior_cot_builders.with_prefix), so strip it on the way in and
 #: store the bare payload. Normalizing on both sides keeps the invariant even if
 #: only one of them ran.
+# Storage convention, matching tools/build_bg_fields.py exactly:
+#   atomic_task  -> stored BARE; SubtaskCoTBuilder / BeliefGraphSubtaskCoTBuilder
+#                   unconditionally prepend "Subtask: ".
+#   bg_belief / bg_delta / bg_effect / bg_observe
+#                -> stored WITH their prefix. BeliefGraph*CoTBuilder calls
+#                   _strip_prefix then re-adds, so the prefix still appears exactly
+#                   once either way — but keeping it matters for a second reason:
+#                   BaseSamplesBuilder._INVALID_STRINGS rejects the bare string
+#                   "none", so a stored bare "none" would make the candidate
+#                   inapplicable and silently drop every satisfied-goal /
+#                   no-known-operator frame from supervision. "Delta: none" passes.
+#   bg_known     -> stored as "Remaining: ... | Known: ...", re-serialized by
+#                   BeliefGraphBuilder._format_bg_known; nothing is stripped.
 KNOWN_PREFIXES = {
     "subtask": "Subtask",
-    "belief": "Belief",
-    "delta": "Delta",
-    "effect": "Effect",
-    "bgcond": "BGcond",
 }
 
 
@@ -198,7 +209,7 @@ def read_bg_targets(path: Path, rows: SourceRows) -> None:
     """Read `cot_targets.parquet` from the solution repo's `bg` branch.
 
     Expected columns: ``episode``, ``frame``, and any of ``subtask`` / ``belief``
-    / ``delta`` / ``effect`` / ``bgcond``. ``task`` is carried for provenance and
+    / ``delta`` / ``effect`` / ``observe``. ``task`` is carried for provenance and
     ignored here. Column names are matched case-insensitively and a few obvious
     aliases (``episode_index``, ``frame_index``) are accepted, because the exact
     spelling is owned by the other repository. Anything else fails loudly rather
@@ -221,13 +232,25 @@ def read_bg_targets(path: Path, rows: SourceRows) -> None:
             f"expected 'episode' and 'frame' (or *_index)."
         )
 
+    # cot_targets.parquet (bgdata) spells the columns without the bg_ prefix; the
+    # canonical loader fields carry it. tools/build_bg_fields.py is the preferred
+    # path (it also derives bg_known and bg_observe); this mapping keeps the raw
+    # cot_targets.parquet readable directly.
+    _SOURCE_TO_LABEL = {
+        "subtask": "subtask",
+        "belief": "bg_belief",
+        "delta": "bg_delta",
+        "effect": "bg_effect",
+        "observe": "bg_observe",
+        "bg_known": "bg_known",
+    }
     label_cols = {
-        label: lower[label] for label in ("subtask", "belief", "delta", "effect", "bgcond")
-        if label in lower
+        _SOURCE_TO_LABEL[src]: lower[src] for src in _SOURCE_TO_LABEL if src in lower
     }
     if not label_cols:
         sys.exit(
-            f"{path}: none of subtask/belief/delta/effect/bgcond present. Got {list(df.columns)}."
+            f"{path}: none of subtask/belief/delta/effect/observe present. "
+            f"Got {list(df.columns)}."
         )
     log(f"  bg targets: {len(df)} rows, labels={sorted(label_cols)}")
 
@@ -358,20 +381,30 @@ def synthesize(geom: DatasetGeometry, episodes: int, target_hz: float, seed: int
             verb = verbs[int(rng.integers(len(verbs)))]
             _insert(rows, episode, frame, "subtask", f"{verb} the {obj}")
             _insert(
-                rows, episode, frame, "belief",
-                f"(inside {obj} fridge_1) {rng.random():.2f} obs | (open fridge_1) {rng.random():.2f} prior",
+                rows, episode, frame, "bg_belief",
+                f"Belief: (inside {obj} fridge_1) {rng.random():.2f} obs | "
+                f"(open fridge_1) {rng.random():.2f} prior",
             )
             _insert(
-                rows, episode, frame, "delta",
-                "none" if rng.random() < 0.35 else f"(cooked ?x) {int(rng.integers(0,3))}/3 [{obj.split('_')[0]}.n.02]",
+                rows, episode, frame, "bg_observe",
+                f"Observe: (ontop {obj} countertop_3) 1 | (open fridge_1) {int(rng.integers(0, 2))}",
             )
             _insert(
-                rows, episode, frame, "effect",
-                "none" if rng.random() < 0.5 else f"(inhand {obj}) 0>1 | (inside {obj} fridge_1) 1>0",
+                rows, episode, frame, "bg_delta",
+                "Delta: none" if rng.random() < 0.35
+                else f"Delta: (cooked ?x) {int(rng.integers(0,3))}/3 [{obj.split('_')[0]}.n.02]",
             )
             _insert(
-                rows, episode, frame, "bgcond",
-                f"(ontop {obj} countertop_3) {rng.random():.2f} obs",
+                rows, episode, frame, "bg_effect",
+                "Effect: none" if rng.random() < 0.5
+                else f"Effect: (inhand {obj}) 0>1 | (inside {obj} fridge_1) 1>0",
+            )
+            # bg_known is the PREVIOUS snapshot's "Remaining: ... | Known: ..."
+            # (build_bg_fields.py derives it from the prior 1 Hz row).
+            _insert(
+                rows, episode, frame, "bg_known",
+                f"Remaining: (cooked ?x) 0/2 [hotdog.n.02] | "
+                f"Known: (ontop {obj} countertop_3) {rng.random():.2f} obs",
             )
         # bbox / trace are frame-exact and denser (every 5th frame here).
         for frame in range(0, length, 5):
@@ -494,7 +527,7 @@ def align_episode(
     for t in range(length):
         entry = {"episode": episode, "frame": t}
         interesting = False
-        for label in ("belief", "bgcond"):
+        for label in ("bg_belief", "bg_known"):
             s = int(out_source[label][t])
             if s >= 0:
                 entry["bg_source_frame"] = s
@@ -706,7 +739,7 @@ def main() -> int:
         "--max-staleness-frames",
         type=int,
         default=None,
-        help="drop snapshot labels (belief/bgcond) held forward longer than this",
+        help="drop snapshot labels (bg_known/bg_belief/bg_observe) held forward longer than this",
     )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()

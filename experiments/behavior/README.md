@@ -4,6 +4,9 @@ Team-side additions on the `behavior2026` branch of the GalaxeaVLA fork. Everyth
 driven from the competition repo (`behavior1k-2026-solution/scripts/*.sh`); this file documents
 what lives inside GalaxeaVLA itself.
 
+> **CoT post-training** (canonical BeliefGraph protocol, AR-only) is documented
+> separately in [`COT.md`](COT.md). This file covers the no-CoT action baseline.
+
 ## Files added / changed vs. upstream
 
 | Path | Purpose |
@@ -13,6 +16,11 @@ what lives inside GalaxeaVLA itself.
 | `src/g05/data_processor/transforms/relative_action_partial.py` | `RelativeJointTransformPartial`: torso targets relative, base velocity absolute |
 | `scripts/serve_g05_b1k.py` | Websocket policy server speaking the `omnigibson.eval.eval` protocol |
 | `tools/make_b1k_subset.py` | Builds a task-filtered LeRobot-v3 subset with derived `action.*` / `observation.state.*` columns |
+| `configs/task/behavior_cot.yaml` | CoT post-training: canonical BeliefGraph candidates, AR-only (no FM). See `COT.md` |
+| `src/g05/data_processor/processor/samples_builder.py` | `BeliefGraph*` builder family (ported from the bg delivery snapshot) + BG-conditioned BBox/Trace |
+| `src/g05/belief_graph/` | External belief module for inference (belief memory, operators, goal delta, estimator, runtime, serving middleware) |
+| `tools/build_bg_fields.py`, `tools/join_bg_dataset.py`, `tools/eval_estimator.py` | bgdata -> `bg_*_index` field conversion, scratch-dataset join, estimator gate |
+| `tools/merge_b1k_cot_labels.py`, `tools/make_cot_fixture.py` | Multi-episode CoT materialization with causal alignment; few-episode test fixture |
 | `tools/extract_model_ckpt.py` | Strips optimizer state from a training checkpoint (~34 GB -> ~11 GB) for inference |
 | `src/g05/models/g05/qwen35/vision.py`, `src/g05/tokenizer/.../modular_actioncodec2v2.py` | `G05_DISABLE_FLASH_ATTN=1` opt-out for GPUs where FA4 kernels cannot be built (e.g. sm_120) |
 

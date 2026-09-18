@@ -6,8 +6,8 @@ of the six candidates in turn through the *real* dataset -> processor ->
 InputPreprocessor.encode_train path and checks the nine invariants the CoT design
 depends on:
 
-    1. BGcond appears before <EOC>
-    2. BGcond tokens are masked out of the LM loss
+    1. BeliefGraph conditioning (bg_known) appears before <EOC>
+    2. that conditioning is masked out of the LM loss
     3. the selected CoT target appears after <EOC>
     4. the target's semantic prefix occurs exactly once
     5. CoT target tokens receive prediction loss
@@ -43,21 +43,25 @@ register_default_resolvers()
 
 from show_vla_label import build_components, load_config  # noqa: E402
 
-from g05.data_processor.processor.behavior_cot_builders import (  # noqa: E402
+from g05.data_processor.processor.samples_builder import (  # noqa: E402
     BEHAVIOR_COT_BUILDERS,
 )
 from g05.models.g05.io.input_preprocessor import TOKEN_INDEX  # noqa: E402
 
 IGNORE_INDEX = -100
 
-#: builder class name -> (annotation field it needs, semantic prefix it emits)
+#: builder class name -> (target field, semantic prefix, takes bg_known conditioning)
+#: Canonical BeliefGraph protocol (origin/bg@4a951d0). BeliefGraphObserveCoTBuilder
+#: deliberately takes NO bg_known: the predicted predicates must come from the
+#: images, not from the belief memory.
 EXPECTED = {
-    "BGSubtaskCoTBuilder": ("atomic_task", "Subtask"),
-    "BGDeltaCoTBuilder": ("delta", "Delta"),
-    "BGBeliefCoTBuilder": ("belief", "Belief"),
-    "BGEffectCoTBuilder": ("effect", "Effect"),
-    "BGBBoxCoTBuilder": ("bbox", "BBox"),
-    "BGTrace2DCoTBuilder": ("trace_2d", "Trace"),
+    "BeliefGraphSubtaskCoTBuilder": ("atomic_task", "Subtask", True),
+    "BeliefGraphDeltaCoTBuilder": ("bg_delta", "Delta", True),
+    "BeliefGraphUpdateCoTBuilder": ("bg_belief", "Belief", True),
+    "BeliefGraphEffectCoTBuilder": ("bg_effect", "Effect", True),
+    "BeliefGraphObserveCoTBuilder": ("bg_observe", "Observe", False),
+    "BeliefGraphBBoxCoTBuilder": ("bbox", "BBox", True),
+    "BeliefGraphTrace2DCoTBuilder": ("trace_2d", "Trace", True),
 }
 
 
@@ -149,7 +153,7 @@ def main() -> int:
 
     for builder_cls in BEHAVIOR_COT_BUILDERS:
         name = builder_cls.__name__
-        field, prefix = EXPECTED[name]
+        field, prefix, wants_bg = EXPECTED[name]
         template_builder = originals[0][1]
         forced = builder_cls(
             num_input_images=template_builder.num_input_images,
@@ -204,13 +208,18 @@ def main() -> int:
 
         problems = []
 
-        # 1 + 2: BGcond before EOC and masked
-        if "BGcond:" not in prefix_text:
-            problems.append("BGcond missing from the conditioning region")
-        else:
-            # every token up to the start of the generative region is conditioning
-            if not bool((lab[:cot_lo] == IGNORE_INDEX).all()):
-                problems.append("conditioning region (incl. BGcond) is not fully masked")
+        # 1 + 2: BeliefGraph conditioning before EOC and masked
+        has_bg_slot = "BeliefGraph:" in prefix_text
+        if wants_bg and not has_bg_slot:
+            problems.append("BeliefGraph conditioning missing from the conditioning region")
+        if not wants_bg and has_bg_slot:
+            problems.append(
+                "BeliefGraphObserveCoTBuilder must NOT receive bg_known conditioning "
+                "(belief state would leak into 'perception')"
+            )
+        # every token up to the start of the generative region is conditioning
+        if not bool((lab[:cot_lo] == IGNORE_INDEX).all()):
+            problems.append("conditioning region (incl. BeliefGraph slot) is not fully masked")
 
         # 3 + 4 + 9: target after EOC, prefix once, matches the annotation
         if f"{prefix}:" not in cot_text:
@@ -240,7 +249,7 @@ def main() -> int:
         print(f"  annotation   : {str(annotation)[:110]}")
         print(f"  slot value   : {str(expected_slot)[:110]}")
         print(f"  decoded CoT  : {cot_text[:150]!r}")
-        print(f"  BGcond seen  : {'BGcond:' in prefix_text}  (masked: "
+        print(f"  BeliefGraph  : present={has_bg_slot} expected={wants_bg}  (conditioning masked: "
               f"{bool((lab[:cot_lo] == IGNORE_INDEX).all())})")
         print(f"  regions      : cot=[{cot_lo},{cot_hi})  action=[{a0},{action_runs[-1][1]})")
         for p in problems:
@@ -253,7 +262,7 @@ def main() -> int:
         for f in failures:
             print(f"  - {f}")
         return 1
-    print(f"All {len(BEHAVIOR_COT_BUILDERS)} builders satisfy the 9 template invariants.")
+    print(f"All {len(BEHAVIOR_COT_BUILDERS)} canonical BeliefGraph builders satisfy the template invariants.")
     return 0
 
 

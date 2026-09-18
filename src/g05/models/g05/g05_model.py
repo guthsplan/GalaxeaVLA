@@ -529,7 +529,8 @@ class G05Model(nn.Module):
         Time sampling is done internally by fm_helper; callers do not need to handle it.
 
         Returns:
-            loss_dict with keys: fm_loss, ce_loss (optional), action_accuracy (optional)
+            loss_dict with keys: fm_loss (only when continuous_action=True),
+            ce_loss (optional), action_accuracy (optional)
         """
         dtype = next(iter(pixel_values.values())).dtype
         device = input_ids.device
@@ -555,32 +556,45 @@ class G05Model(nn.Module):
             cot_accuracy = cache["cot_accuracy"] if cache else 0.0
         else:
             ce_loss, overall_accuracy, action_accuracy, cot_accuracy = None, 0.0, 0.0, 0.0
-        # 5. FM loss delegated to fm_helper; time sampling happens inside the helper.
-        # Pre-slice the prefix so FM helper does not need to know split_index.
-        vlm_kv_prefix = [(k[:, :, :split_index], v[:, :, :split_index]) for k, v in vlm_kv]
-        fm_loss = self.fm_helper.train_step(
-            self,
-            vlm_kv_prefix,
-            attention_mask[:, :split_index],
-            position_ids[:, :split_index],
-            actions,
-            action_pad_masks,
-            action_dim_is_pad,
-            dtype,
-            embodiment_types=kwargs.get("embodiment_types"),
-        )
-        # Mask FM loss for VLM-only batches
-        if not continuous_action:
-            fm_loss = fm_loss * 0
+        # 5. FM loss delegated to fm_helper, only when continuous actions are
+        # actually trained. See the matching comment in g05_model_qwen35.py: the
+        # old code called train_step() unconditionally and zeroed the result, which
+        # paid for the flow head's forward, time/noise sampling and activations and
+        # then threw them away. AR-only configs (discrete_action=true,
+        # continuous_action=false) never consumed that gradient.
+        # Behaviour is unchanged for continuous_action=true.
+        loss_dict: Dict[str, torch.Tensor] = {}
+        if continuous_action:
+            # Pre-slice the prefix so FM helper does not need to know split_index.
+            vlm_kv_prefix = [(k[:, :, :split_index], v[:, :, :split_index]) for k, v in vlm_kv]
+            loss_dict["fm_loss"] = self.fm_helper.train_step(
+                self,
+                vlm_kv_prefix,
+                attention_mask[:, :split_index],
+                position_ids[:, :split_index],
+                actions,
+                action_pad_masks,
+                action_dim_is_pad,
+                dtype,
+                embodiment_types=kwargs.get("embodiment_types"),
+            )
         if skip_ce_loss:
-            return {"fm_loss": fm_loss}
-        return {
-            "fm_loss": fm_loss,
-            "ce_loss": ce_loss,
-            "overall_accuracy": overall_accuracy,
-            "action_accuracy": action_accuracy,
-            "cot_accuracy": cot_accuracy,
-        }
+            if not loss_dict:
+                raise ValueError(
+                    "Nothing to optimise: skip_ce_loss=True and continuous_action=False "
+                    "leave neither a CE nor an FM term. Enable discrete_action or "
+                    "predict_cot (so CE runs), or continuous_action (so FM runs)."
+                )
+            return loss_dict
+        loss_dict.update(
+            {
+                "ce_loss": ce_loss,
+                "overall_accuracy": overall_accuracy,
+                "action_accuracy": action_accuracy,
+                "cot_accuracy": cot_accuracy,
+            }
+        )
+        return loss_dict
 
     # ------------------------------------------------------------------
     # Inference facades delegated to helpers

@@ -10,6 +10,12 @@ Existing builders:
 - SubtaskCoTBuilder:               subtask CoT
 - BBoxCoTBuilder:                  bbox CoT target
 - MemorySamplesBuilder:            memory input
+- BeliefGraphBuilder:              belief-graph conditioning input (BEHAVIOR bgdata pipeline)
+- BeliefGraph{Delta,Update,Effect,Subtask}CoTBuilder:
+                                   BG input + Delta:/Belief:/Effect:/Subtask: CoT
+- BeliefGraphObserveCoTBuilder:    Observe: CoT (model-as-estimator; no bg_known input)
+- BeliefGraph{BBox,Trace2D}CoTBuilder:
+                                   BG input + bbox / 2D-trace CoT (BEHAVIOR addition)
 
 Adding a builder takes only 3 steps:
 
@@ -785,6 +791,331 @@ class PlanStepCoTBuilder(BaseSamplesBuilder):
         samples["plan"] = plan
         samples["plan_step"] = f"Step: {current_step}" if current_step else ""
         samples["cotprefix"] = "Please output the current plan step:"
+
+
+class BeliefGraphBuilder(BaseSamplesBuilder):
+    """VLA + belief-graph conditioning input (masked, no loss).
+
+    Injects the serialized belief-graph state Δt = G_goal ⊖ Ĝt (BEHAVIOR belief-graph
+    pipeline, bgdata) into the conditioning segment, analogous to MemorySamplesBuilder:
+    the model sees the remaining goal predicates and the current predicate beliefs
+    before predicting the action.
+
+    Data source (lerobot_dataset_v3.py):
+        data["bg_known"] <- bg_known_index looks up the tasks table. Either a
+            pre-serialized string
+                "Remaining: (cooked ?x) 0/2 [hotdog.n.02] | Known: (inhand hotdog_207) 0.97 obs | ..."
+            or a JSON string
+                {"remaining": ["(cooked ?x) 0/2 [hotdog.n.02]"],
+                 "known": [["(inhand hotdog_207)", 0.97, true], ...]}
+            Produced offline by the bgdata pipeline (sidecar/belief trace, GT-masked)
+            for training; produced online by the external belief module at inference.
+
+    Template (embodiment=r1, 2 cameras, discrete):
+        <image0_image_!><image1_image_!><bos>Embodiment: <embodiment_text_!>; Task: <command_text_!_200> BeliefGraph: <bg_known_text_!> State: <proprio_proprio_!>;
+        Action: <EOV><EOC><action_action>|<eos>
+    """
+
+    required_fields = ("bg_known",)
+    eval_required_fields = ("bg_known",)
+
+    #: predicate-key prefixes recognised when re-serializing JSON payloads
+    _KNOWN_LIMIT = 8
+
+    @property
+    def template(self) -> str:
+        return (
+            "<chat_user_prefix>" + self._images + "<bos>"
+            "Embodiment: <embodiment_text_!>; Task: <command_text_!_200> "
+            "BeliefGraph: <bg_known_text_!> State: <proprio_proprio_!>;"
+            "<chat_user_suffix><chat_assistant_prefix>"
+            "Action: <EOV><EOC><action_action>|<eos>"
+        )
+
+    @staticmethod
+    def _strip_prefix(text: str, prefix: str) -> str:
+        """Idempotent prefixing: 'Delta: none' and 'none' both serialize identically."""
+        text = (text or "").strip()
+        if text.lower().startswith(prefix.lower() + ":"):
+            text = text[len(prefix) + 1 :].strip()
+        return text
+
+    @classmethod
+    def _format_bg_known(cls, raw) -> str:
+        """Accept pre-serialized text or JSON {remaining: [...], known: [[k, p, obs], ...]}."""
+        import json
+
+        if raw is None:
+            return ""
+        if isinstance(raw, str):
+            s = raw.strip()
+            try:
+                raw = json.loads(s)
+            except (json.JSONDecodeError, TypeError):
+                return s  # already serialized text
+        if not isinstance(raw, dict):
+            return str(raw)
+        rem = raw.get("remaining") or []
+        known = raw.get("known") or []
+        parts = ["Remaining: " + (" | ".join(rem) if rem else "none")]
+        ks = [
+            f"{k} {float(p):.2f} {'obs' if o else 'mem'}"  # obs/mem: matches the training
+            for k, p, o in list(known)[: cls._KNOWN_LIMIT]  # text of tools/build_bg_fields.py
+        ]
+        if ks:
+            parts.append("Known: " + " | ".join(ks))
+        return " ".join(parts)
+
+    def _populate_extra_samples(self, data, samples):
+        samples["bg_known"] = self._format_bg_known(data.get("bg_known", ""))
+
+
+class BeliefGraphDeltaCoTBuilder(BeliefGraphBuilder):
+    """Belief-graph input + remaining-goal (Delta:) CoT output.
+
+    The model restates the unsatisfied goal count lines before acting; at inference
+    the prediction is cross-checked against the external belief module's Δt
+    (disagreement triggers re-observation, see G05_REDESIGN.md §6).
+
+    Data source (lerobot_dataset_v3.py):
+        data["bg_known"] <- bg_known_index (input, masked)
+        data["bg_delta"] <- bg_delta_index, e.g. "(cooked ?x) 0/2 [hotdog.n.02]"
+                            ('Delta:' prefix optional — added idempotently)
+
+    Template (embodiment=r1, 2 cameras, discrete):
+        <image0_image_!><image1_image_!><bos>Embodiment: <embodiment_text_!>; Task: <command_text_!_200> BeliefGraph: <bg_known_text_!> State: <proprio_proprio_!>;
+        <prompt_text_!>\n<EOC><bg_delta_text>|
+        Action: <EOV><action_action>|<eos>
+    """
+
+    required_fields = ("bg_known", "bg_delta")
+    eval_required_fields = ("bg_known",)
+
+    _COT_FIELD = "bg_delta"
+    _COT_PREFIX = "Delta"
+    _COT_PROMPT = "predict remaining goal predicates"
+
+    @property
+    def template(self) -> str:
+        return (
+            "<chat_user_prefix>" + self._images + "<bos>"
+            "Embodiment: <embodiment_text_!>; Task: <command_text_!_200> "
+            "BeliefGraph: <bg_known_text_!> State: <proprio_proprio_!>;"
+            "<chat_user_suffix><chat_assistant_prefix>"
+            f"<prompt_text_!>\n<EOC><{self._COT_FIELD}_text>|"
+            "Action: <EOV><action_action>|<eos>"
+        )
+
+    def _populate_extra_samples(self, data, samples):
+        super()._populate_extra_samples(data, samples)  # sets samples["bg_known"]
+        body = self._strip_prefix(str(data.get(self._COT_FIELD, "") or ""), self._COT_PREFIX)
+        samples[self._COT_FIELD] = f"{self._COT_PREFIX}: {body}"
+        samples["prompt"] = self._COT_PROMPT
+
+
+class BeliefGraphUpdateCoTBuilder(BeliefGraphDeltaCoTBuilder):
+    """Belief-graph input + updated-belief (Belief:) CoT output.
+
+    Analogous to MemoryCoTBuilder: bg_known carries the previous belief snapshot
+    (input, masked); the CoT target is the current-frame belief summary, teaching
+    the model to maintain a symbolic scene state.
+
+    Data source (lerobot_dataset_v3.py):
+        data["bg_known"]  <- bg_known_index (previous snapshot, input)
+        data["bg_belief"] <- bg_belief_index, e.g.
+            "(inhand hotdog_207) 0.97 obs | (open fridge) 0.97 mem"
+    """
+
+    required_fields = ("bg_known", "bg_belief")
+    eval_required_fields = ("bg_known",)
+
+    _COT_FIELD = "bg_belief"
+    _COT_PREFIX = "Belief"
+    _COT_PROMPT = "predict updated belief graph"
+
+
+class BeliefGraphEffectCoTBuilder(BeliefGraphDeltaCoTBuilder):
+    """Belief-graph input + symbolic-effect (Effect:) CoT output.
+
+    The target is the predicate changes the imminent skill will cause, grounded
+    from the operator library (bgdata/operators.py), e.g. "(open fridge) 1>0".
+    Ties action prediction to its symbolic postcondition.
+
+    Data source (lerobot_dataset_v3.py):
+        data["bg_known"]  <- bg_known_index (input, masked)
+        data["bg_effect"] <- bg_effect_index
+    """
+
+    required_fields = ("bg_known", "bg_effect")
+    eval_required_fields = ("bg_known",)
+
+    _COT_FIELD = "bg_effect"
+    _COT_PREFIX = "Effect"
+    _COT_PROMPT = "predict symbolic effect of the next skill"
+
+
+class BeliefGraphObserveCoTBuilder(BaseSamplesBuilder):
+    """Observe: CoT — the model AS the predicate estimator (perception only).
+
+    The target is the set of predicates VISIBLE at this frame with their values
+    ("(open fridge) 1 | (inside hotdog_207 fridge) 1 | (cooked hotdog_207) 0"),
+    supervised by the visibility-masked labels of the bgdata pipeline. Deliberately
+    does NOT take bg_known conditioning: the observation must come from the images,
+    not from the memory, so belief state cannot leak into "perception". Robot-tag
+    predicates (inhand/reachable/visited) are excluded — proprioception supplies
+    them at inference.
+
+    At inference the runtime parses this span (g05.belief_graph: parse_observe /
+    BeliefGraphRuntime.on_model_cot) and feeds it into the EXTERNAL belief table as
+    observations — replacing the RGB-D hybrid estimator while the no-decay memory
+    rules stay guaranteed outside the model ("model-as-estimator").
+
+    Data source (lerobot_dataset_v3.py):
+        data["bg_observe"] <- bg_observe_index looks up the tasks table
+                              ('Observe:' prefix optional — added idempotently)
+
+    Template (embodiment=r1, 2 cameras, discrete):
+        <image0_image_!><image1_image_!><bos>Embodiment: <embodiment_text_!>; Task: <command_text_!_200> State: <proprio_proprio_!>;
+        <prompt_text_!>\n<EOC><bg_observe_text>|
+        Action: <EOV><action_action>|<eos>
+    """
+
+    required_fields = ("bg_observe",)
+    eval_required_fields = ()
+
+    @property
+    def template(self) -> str:
+        return (
+            "<chat_user_prefix>" + self._images + "<bos>"
+            "Embodiment: <embodiment_text_!>; Task: <command_text_!_200> State: <proprio_proprio_!>;"
+            "<chat_user_suffix><chat_assistant_prefix>"
+            "<prompt_text_!>\n<EOC><bg_observe_text>|"
+            "Action: <EOV><action_action>|<eos>"
+        )
+
+    def _populate_extra_samples(self, data, samples):
+        body = BeliefGraphBuilder._strip_prefix(str(data.get("bg_observe", "") or ""), "Observe")
+        samples["bg_observe"] = f"Observe: {body}"
+        samples["prompt"] = "predict visible predicates"
+
+
+class BeliefGraphSubtaskCoTBuilder(BeliefGraphBuilder):
+    """Belief-graph input + subtask CoT output.
+
+    Combines BG conditioning with the standard Subtask: target (atomic_task),
+    replacing the separate high-level head of the π0.5 design with a CoT turn
+    of the same decoder.
+
+    Data source (lerobot_dataset_v3.py):
+        data["bg_known"]    <- bg_known_index (input, masked)
+        data["atomic_task"] <- atomic_task_index
+    """
+
+    required_fields = ("bg_known", "atomic_task")
+    eval_required_fields = ("bg_known",)
+
+    @property
+    def template(self) -> str:
+        return (
+            "<chat_user_prefix>" + self._images + "<bos>"
+            "Embodiment: <embodiment_text_!>; Task: <command_text_!_200> "
+            "BeliefGraph: <bg_known_text_!> State: <proprio_proprio_!>;"
+            "<chat_user_suffix><chat_assistant_prefix>"
+            "<prompt_text_!>\n<EOC><atomic_task_text>|"
+            "Action: <EOV><action_action>|<eos>"
+        )
+
+    def _populate_extra_samples(self, data, samples):
+        super()._populate_extra_samples(data, samples)  # sets samples["bg_known"]
+        samples["atomic_task"] = f"Subtask: {data.get('atomic_task', '')}"
+        samples["prompt"] = "predict subtask"
+
+
+class BeliefGraphBBoxCoTBuilder(BeliefGraphBuilder, BBoxCoTBuilder):
+    """Belief-graph input + bbox CoT output.
+
+    BEHAVIOR addition: the snapshot that introduced the BeliefGraph* family has no
+    BG-conditioned bbox variant, but the BEHAVIOR CoT extractor produces frame-level
+    bbox labels and they should see the same conditioning as every other candidate.
+    Inherits BBoxCoTBuilder._format_bbox_json (which owns the "BBox: " prefix and
+    the <locNNNN> encoding) and its non-empty-JSON can_handle, unchanged.
+
+    Data source (lerobot_dataset_v3.py):
+        data["bg_known"] <- bg_known_index (input, masked)
+        data["bbox"]     <- bbox_index, JSON {"obj": [x1, y1, x2, y2], ...}
+    """
+
+    required_fields = ("bg_known", "bbox")
+    eval_required_fields = ("bg_known",)
+
+    @property
+    def template(self) -> str:
+        return (
+            "<chat_user_prefix>" + self._images + "<bos>"
+            "Embodiment: <embodiment_text_!>; Task: <command_text_!_200> "
+            "BeliefGraph: <bg_known_text_!> State: <proprio_proprio_!>;"
+            "<chat_user_suffix><chat_assistant_prefix>"
+            "<prompt_text_!>\n<EOC><bbox_text>|"
+            "Action: <EOV><action_action>|<eos>"
+        )
+
+    def can_handle(self, data):
+        # BeliefGraphBuilder contributes the bg_known requirement via required_fields;
+        # BBoxCoTBuilder contributes the non-empty-JSON check. MRO gives us both.
+        return BBoxCoTBuilder.can_handle(self, data)
+
+    def _populate_extra_samples(self, data, samples):
+        BeliefGraphBuilder._populate_extra_samples(self, data, samples)  # bg_known
+        samples["bbox"] = self._format_bbox_json(data.get("bbox", "{}"))
+        samples["prompt"] = "predict bbox"
+
+
+class BeliefGraphTrace2DCoTBuilder(BeliefGraphBuilder, Trace2DCoTBuilder):
+    """Belief-graph input + 2D gripper-trace CoT output.
+
+    BEHAVIOR addition, same rationale as BeliefGraphBBoxCoTBuilder. Inherits
+    Trace2DCoTBuilder._format_trace_2d_json (owns the "Trace: " prefix) and its
+    "at least one arm visible" can_handle, unchanged.
+
+    Data source (lerobot_dataset_v3.py):
+        data["bg_known"] <- bg_known_index (input, masked)
+        data["trace_2d"] <- 2d_trace_index, JSON with uv_left/uv_right + visb flags
+    """
+
+    required_fields = ("bg_known", "trace_2d")
+    eval_required_fields = ("bg_known",)
+
+    @property
+    def template(self) -> str:
+        return (
+            "<chat_user_prefix>" + self._images + "<bos>"
+            "Embodiment: <embodiment_text_!>; Task: <command_text_!_200> "
+            "BeliefGraph: <bg_known_text_!> State: <proprio_proprio_!>;"
+            "<chat_user_suffix><chat_assistant_prefix>"
+            "<prompt_text_!>\n<EOC><trace_2d_text>|"
+            "Action: <EOV><action_action>|<eos>"
+        )
+
+    def can_handle(self, data):
+        return Trace2DCoTBuilder.can_handle(self, data)
+
+    def _populate_extra_samples(self, data, samples):
+        BeliefGraphBuilder._populate_extra_samples(self, data, samples)  # bg_known
+        samples["trace_2d"] = self._format_trace_2d_json(data.get("trace_2d", "{}"))
+        samples["prompt"] = "predict 2d trace of gripper"
+
+
+#: Every candidate the BEHAVIOR CoT task config may draw from. Order matches
+#: configs/task/behavior_cot.yaml; weights live only in that config.
+BEHAVIOR_COT_BUILDERS = (
+    BeliefGraphSubtaskCoTBuilder,
+    BeliefGraphDeltaCoTBuilder,
+    BeliefGraphUpdateCoTBuilder,
+    BeliefGraphEffectCoTBuilder,
+    BeliefGraphObserveCoTBuilder,
+    BeliefGraphBBoxCoTBuilder,
+    BeliefGraphTrace2DCoTBuilder,
+)
 
 
 class MixedSamplesBuilder(BaseSamplesBuilder):

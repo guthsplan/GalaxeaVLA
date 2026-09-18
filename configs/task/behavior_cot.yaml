@@ -1,24 +1,44 @@
 # @package _global_
-# G0.5 CoT post-training on BEHAVIOR 2026.
+# G0.5 CoT post-training on BEHAVIOR 2026 — canonical BeliefGraph protocol, AR-only.
 #
 # Inherits everything from `behavior.yaml` (optimiser, 27-D grouped action layout,
 # single-frame obs, ActionCodec settings, data config) and changes only what CoT
-# supervision requires. The no-CoT baseline `behavior.yaml` is untouched and keeps
-# working exactly as before:
+# supervision and the AR-only objective require. The no-CoT baseline
+# `behavior.yaml` is untouched and keeps working exactly as before:
 #
 #     bash scripts/run/finetune.sh 1 behavior      --dry-run   # baseline, unchanged
 #     bash scripts/run/finetune.sh 1 behavior_cot  --dry-run   # this config
 #
-# The action path is deliberately identical to the baseline: same ActionCodec,
-# same chunk size, same gripper binarisation, same relative arm transform, same
-# lower_body convention. This config adds language supervision *around* that path,
-# it does not alter it.
+# Sequence this config trains (qwen35-base resolution):
+#
+#   <images> Embodiment: ...; Task: ... BeliefGraph: <bg_known masked> State: <proprio>;
+#   <prompt masked>
+#   <EOC> <one CoT target> | Action: <EOV> <ActionCodec RVQ tokens> | <eos>
+#   |<----------- conditioning, no loss ----------->|<--------- single AR CE --------->|
+#
+# Continuous robot actions come from ActionCodec.decode() on those discrete tokens,
+# NOT from flow matching. See the AR-only block below.
 defaults:
 - behavior
 - _self_
 
 model:
   model_arch:
+    # ---- AR-only -----------------------------------------------------------
+    # BEHAVIOR CoT is a pure autoregressive policy: reasoning tokens, then <EOV>,
+    # then ActionCodec RVQ action tokens, all in one next-token CE. The flow
+    # matching action head is not trained and not used at inference.
+    #   discrete_action=true          -> ActionCodec tokens are AR targets
+    #   continuous_action=false       -> G05Model.forward skips fm_helper.train_step
+    #                                    entirely (not "multiply by zero"), and
+    #                                    G05Policy.generate_action skips inference_fm
+    #   return_continuous_action=false-> no continuous head output is requested
+    # Actions are recovered with ActionCodec.decode(action_tokens).
+    discrete_action: true
+    continuous_action: false
+    return_continuous_action: false
+
+    # ---- CoT ---------------------------------------------------------------
     # Required for CoT training. Three distinct effects, all verified in code:
     #  1. g05_policy.py:695  — keeps CE loss alive (skip_ce_loss is False)
     #  2. g05_policy.py:711  — pushes cot_accuracy into the accumulator, so
@@ -40,8 +60,8 @@ model:
       pred_eov: true
 
   processor:
-    # Training-time CoT selection. MixedSamplesBuilder (samples_builder.py:790)
-    # already implements exactly the required policy:
+    # Training-time CoT selection. MixedSamplesBuilder (samples_builder.py) already
+    # implements exactly the required policy:
     #   1. filter candidates by can_handle(data)  — a sample missing an annotation
     #      simply drops that candidate
     #   2. random.choices over the *applicable* subset, by weight
@@ -50,42 +70,53 @@ model:
     #
     # `_recursive_: false` stops Hydra instantiating the candidate dicts; the
     # builder resolves each `_target_` itself via pydoc.locate.
+    #
+    # All candidates are the canonical BeliefGraph* family. Every one except
+    # Observe takes `bg_known` (the previous 1 Hz snapshot) as masked conditioning
+    # in the `BeliefGraph:` slot; Observe deliberately takes none, so the predicted
+    # predicates must come from the images rather than from memory.
     samples_builder:
       _target_: g05.data_processor.processor.samples_builder.MixedSamplesBuilder
       _partial_: true
       _recursive_: false
 
-      # Initial weight policy: Subtask : Delta : Belief : Effect = 3 : 2 : 2 : 1,
-      # with BBox and Trace at 1 each. Weights are relative and are renormalised
-      # over whichever candidates are applicable to each sample, so the empirical
-      # mix follows label coverage as well as these numbers.
+      # Weights follow G05_REDESIGN.md §2: Subtask 3 : Delta 2 : Belief 2 : Effect 1.
+      # Observe joins at 2 — it is what the inference runtime actually consumes
+      # (BeliefGraphRuntime.on_model_cot parses the span back into the external
+      # belief table), so it needs real supervision. BBox/Trace stay at 1 each as
+      # auxiliary grounding. Weights are relative and are renormalised over
+      # whichever candidates are applicable to each sample, so the empirical mix
+      # follows label coverage as well as these numbers.
       # Override per run, e.g.:
       #   model.processor.samples_builder.candidates.0.weight=5
       candidates:
-      - _target_: g05.data_processor.processor.behavior_cot_builders.BGSubtaskCoTBuilder
+      - _target_: g05.data_processor.processor.samples_builder.BeliefGraphSubtaskCoTBuilder
         weight: 3
-      - _target_: g05.data_processor.processor.behavior_cot_builders.BGDeltaCoTBuilder
+      - _target_: g05.data_processor.processor.samples_builder.BeliefGraphDeltaCoTBuilder
         weight: 2
-      - _target_: g05.data_processor.processor.behavior_cot_builders.BGBeliefCoTBuilder
+      - _target_: g05.data_processor.processor.samples_builder.BeliefGraphUpdateCoTBuilder
         weight: 2
-      - _target_: g05.data_processor.processor.behavior_cot_builders.BGEffectCoTBuilder
+      - _target_: g05.data_processor.processor.samples_builder.BeliefGraphObserveCoTBuilder
+        weight: 2
+      - _target_: g05.data_processor.processor.samples_builder.BeliefGraphEffectCoTBuilder
         weight: 1
-      - _target_: g05.data_processor.processor.behavior_cot_builders.BGBBoxCoTBuilder
+      - _target_: g05.data_processor.processor.samples_builder.BeliefGraphBBoxCoTBuilder
         weight: 1
-      - _target_: g05.data_processor.processor.behavior_cot_builders.BGTrace2DCoTBuilder
+      - _target_: g05.data_processor.processor.samples_builder.BeliefGraphTrace2DCoTBuilder
         weight: 1
 
       # Inference / validation uses this builder deterministically — the weighted
       # random draw above is training-only (MixedSamplesBuilder.build checks
       # self._training, set from GalaxeaCoTProcessor.train()/eval()).
       #
-      # BGSubtaskCoTBuilder is the intended deployment mode: subtask reasoning is
-      # what the policy server consumes, and its eval_required_fields=() means it
-      # matches every sample regardless of which labels exist.
-      # Set to `null` instead to evaluate with no CoT at all (falls back to
-      # BaseSamplesBuilder), which reproduces the baseline's validation path.
+      # BeliefGraphSubtaskCoTBuilder is the intended deployment mode: subtask
+      # reasoning is what the policy server consumes, and its
+      # eval_required_fields=("bg_known",) means it matches whenever BG
+      # conditioning is available, falling back to BaseSamplesBuilder otherwise.
+      # Set to `null` instead to evaluate with no CoT at all, which reproduces the
+      # baseline's validation path.
       eval_builder:
-        _target_: g05.data_processor.processor.behavior_cot_builders.BGSubtaskCoTBuilder
+        _target_: g05.data_processor.processor.samples_builder.BeliefGraphSubtaskCoTBuilder
 
 logger:
   project: ${oc.env:WANDB_PROJECT,g05-behavior-cot}

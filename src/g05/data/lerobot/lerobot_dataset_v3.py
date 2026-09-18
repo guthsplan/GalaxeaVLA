@@ -103,13 +103,18 @@ _INDEXED_ANNOTATION_FIELDS: tuple[tuple[str, str, object], ...] = (
     ("bbox_index", "bbox", None),
     ("action_hint_index", "action_hint", None),
     ("2d_trace_index", "trace_2d", None),
-    # --- BEHAVIOR-1K 2026 belief-graph fields ---
-    # bgcond is CONDITIONING INPUT (masked, pre-EOC, no LM loss).
-    # belief / delta / effect are CoT PREDICTION TARGETS (post-EOC, clean).
-    ("bgcond_index", "bgcond", None),
-    ("belief_index", "belief", None),
-    ("delta_index", "delta", None),
-    ("effect_index", "effect", None),
+    # --- BEHAVIOR-1K 2026 belief-graph fields (canonical BG protocol) ---
+    # bg_known is CONDITIONING INPUT: the PREVIOUS 1 Hz belief snapshot,
+    # "Remaining: ... | Known: ...", injected into the masked `BeliefGraph:` slot
+    # before <EOC> so it carries no LM loss. Mirrors prev_memory/memory.
+    # bg_belief / bg_delta / bg_effect / bg_observe are CoT PREDICTION TARGETS
+    # (post-EOC, clean, never noised). Produced by tools/build_bg_fields.py from
+    # the bgdata pipeline and joined by tools/join_bg_dataset.py.
+    ("bg_known_index", "bg_known", None),
+    ("bg_belief_index", "bg_belief", None),
+    ("bg_delta_index", "bg_delta", None),
+    ("bg_effect_index", "bg_effect", None),
+    ("bg_observe_index", "bg_observe", None),
 )
 
 
