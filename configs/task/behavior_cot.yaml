@@ -1,0 +1,91 @@
+# @package _global_
+# G0.5 CoT post-training on BEHAVIOR 2026.
+#
+# Inherits everything from `behavior.yaml` (optimiser, 27-D grouped action layout,
+# single-frame obs, ActionCodec settings, data config) and changes only what CoT
+# supervision requires. The no-CoT baseline `behavior.yaml` is untouched and keeps
+# working exactly as before:
+#
+#     bash scripts/run/finetune.sh 1 behavior      --dry-run   # baseline, unchanged
+#     bash scripts/run/finetune.sh 1 behavior_cot  --dry-run   # this config
+#
+# The action path is deliberately identical to the baseline: same ActionCodec,
+# same chunk size, same gripper binarisation, same relative arm transform, same
+# lower_body convention. This config adds language supervision *around* that path,
+# it does not alter it.
+defaults:
+- behavior
+- _self_
+
+model:
+  model_arch:
+    # Required for CoT training. Three distinct effects, all verified in code:
+    #  1. g05_policy.py:695  — keeps CE loss alive (skip_ce_loss is False)
+    #  2. g05_policy.py:711  — pushes cot_accuracy into the accumulator, so
+    #                          finetune.py:1253 logs `train/cot_accuracy`
+    #  3. g05_policy.py:1028 — at inference, runs an AR generate pass that stops
+    #                          at EOV before handing off to action decoding
+    predict_cot: true
+
+    # NOT changed from the baseline: `action_attend_cot` (configs/model/g05.yaml:240)
+    # is declared but referenced by zero Python in this tree — it is inert config.
+    # Left at its default rather than toggled, since flipping it would imply a
+    # behaviour change that does not exist.
+
+    input_preprocessor:
+      # Required. input_preprocessor.py:814-823 builds the <EOV> segment with
+      # `masked = not pred_eov`. With pred_eov=false the EOV token is masked out of
+      # the labels, so the model never learns to emit the reasoning -> action
+      # transition it must generate at inference time.
+      pred_eov: true
+
+  processor:
+    # Training-time CoT selection. MixedSamplesBuilder (samples_builder.py:790)
+    # already implements exactly the required policy:
+    #   1. filter candidates by can_handle(data)  — a sample missing an annotation
+    #      simply drops that candidate
+    #   2. random.choices over the *applicable* subset, by weight
+    #   3. if nothing is applicable, fall back to BaseSamplesBuilder (no CoT)
+    # so there is no second selection mechanism anywhere in this change.
+    #
+    # `_recursive_: false` stops Hydra instantiating the candidate dicts; the
+    # builder resolves each `_target_` itself via pydoc.locate.
+    samples_builder:
+      _target_: g05.data_processor.processor.samples_builder.MixedSamplesBuilder
+      _partial_: true
+      _recursive_: false
+
+      # Initial weight policy: Subtask : Delta : Belief : Effect = 3 : 2 : 2 : 1,
+      # with BBox and Trace at 1 each. Weights are relative and are renormalised
+      # over whichever candidates are applicable to each sample, so the empirical
+      # mix follows label coverage as well as these numbers.
+      # Override per run, e.g.:
+      #   model.processor.samples_builder.candidates.0.weight=5
+      candidates:
+      - _target_: g05.data_processor.processor.behavior_cot_builders.BGSubtaskCoTBuilder
+        weight: 3
+      - _target_: g05.data_processor.processor.behavior_cot_builders.BGDeltaCoTBuilder
+        weight: 2
+      - _target_: g05.data_processor.processor.behavior_cot_builders.BGBeliefCoTBuilder
+        weight: 2
+      - _target_: g05.data_processor.processor.behavior_cot_builders.BGEffectCoTBuilder
+        weight: 1
+      - _target_: g05.data_processor.processor.behavior_cot_builders.BGBBoxCoTBuilder
+        weight: 1
+      - _target_: g05.data_processor.processor.behavior_cot_builders.BGTrace2DCoTBuilder
+        weight: 1
+
+      # Inference / validation uses this builder deterministically — the weighted
+      # random draw above is training-only (MixedSamplesBuilder.build checks
+      # self._training, set from GalaxeaCoTProcessor.train()/eval()).
+      #
+      # BGSubtaskCoTBuilder is the intended deployment mode: subtask reasoning is
+      # what the policy server consumes, and its eval_required_fields=() means it
+      # matches every sample regardless of which labels exist.
+      # Set to `null` instead to evaluate with no CoT at all (falls back to
+      # BaseSamplesBuilder), which reproduces the baseline's validation path.
+      eval_builder:
+        _target_: g05.data_processor.processor.behavior_cot_builders.BGSubtaskCoTBuilder
+
+logger:
+  project: ${oc.env:WANDB_PROJECT,g05-behavior-cot}

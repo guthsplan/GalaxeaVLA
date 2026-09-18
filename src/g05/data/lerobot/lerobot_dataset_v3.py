@@ -71,6 +71,48 @@ from g05.data.lerobot.constants import HF_LEROBOT_HOME
 
 CODEBASE_VERSION = "v3.0"
 
+# ----------------------------------------------------------------------------
+# Indexed-string annotation fields: (<column>_index, item key, value when absent)
+# ----------------------------------------------------------------------------
+# Each entry is an optional int column in the data parquet holding an index into
+# meta/tasks.parquet, whose DataFrame index carries the annotation string. This
+# is the established G0.5 convention (atomic_task_index -> atomic_task,
+# bbox_index -> bbox, 2d_trace_index -> trace_2d); the BEHAVIOR belief-graph
+# fields below follow it unchanged.
+#
+# The "absent" value decides what a present-but-unannotated frame decodes to:
+#   ""   for plain-text fields, whose builders treat empty string as missing
+#        (BaseSamplesBuilder._INVALID_STRINGS)
+#   None for JSON / structured payloads, so can_handle() rejects them outright
+#
+# A missing *column* leaves the key unset entirely, which also makes the
+# corresponding builder inapplicable. Optional annotations therefore degrade to
+# "this candidate cannot handle this sample", never to a dataset-level crash.
+#
+# Field names must not contain the substrings "observation" or "action":
+# BaseLerobotDataset.__getitem__ filters those out of the processor payload.
+# (This is why the pre-existing `action_hint` never reaches SamplesBuilder on the
+# v3 path — kept here for parity with the v2 loader, not because it works.)
+_INDEXED_ANNOTATION_FIELDS: tuple[tuple[str, str, object], ...] = (
+    # --- upstream G0.5 fields ---
+    ("atomic_task_index", "atomic_task", ""),
+    ("high_level_instruction_index", "high_level_instruction", ""),
+    ("plan_index", "plan", ""),
+    ("memory_index", "memory_update", ""),
+    ("prev_memory_index", "memory", ""),
+    ("bbox_index", "bbox", None),
+    ("action_hint_index", "action_hint", None),
+    ("2d_trace_index", "trace_2d", None),
+    # --- BEHAVIOR-1K 2026 belief-graph fields ---
+    # bgcond is CONDITIONING INPUT (masked, pre-EOC, no LM loss).
+    # belief / delta / effect are CoT PREDICTION TARGETS (post-EOC, clean).
+    ("bgcond_index", "bgcond", None),
+    ("belief_index", "belief", None),
+    ("delta_index", "delta", None),
+    ("effect_index", "effect", None),
+)
+
+
 
 class LeRobotDatasetMetadata:
     def __init__(
@@ -157,6 +199,7 @@ class LeRobotDatasetMetadata:
         self.info = load_info(self.root)
         # check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
         self.tasks = load_tasks(self.root)
+        self._task_text_by_index = None
         if (self.root / "annotations").exists():
             self.annotations = load_annotations(self.root)
         self.episodes = load_episodes(self.root)
@@ -303,6 +346,49 @@ class LeRobotDatasetMetadata:
         else:
             return None
 
+    # ------------------------------------------------------------------
+    # O(1) task_index -> task text lookup
+    # ------------------------------------------------------------------
+    # `self.tasks` is a DataFrame indexed by the annotation string with a
+    # `task_index` column. The historical decode path in __getitem__ used
+    # `tasks[tasks["task_index"] == i]`, a full boolean scan of the table for
+    # *every* annotation field of *every* sample. That is fine for the ~100-row
+    # instruction tables of the original datasets, but BEHAVIOR CoT adds
+    # frame-level annotations (bbox / trace / belief / delta / effect), so the
+    # table grows by orders of magnitude and the scan dominates __getitem__.
+    # The map below is built once per metadata object and turns every decode
+    # into a dict hit.
+
+    @property
+    def task_text_by_index(self) -> dict[int, str]:
+        """{task_index: annotation string}, built lazily and cached."""
+        cached = getattr(self, "_task_text_by_index", None)
+        if cached is not None:
+            return cached
+        if self.tasks is None:
+            # Not yet loaded (e.g. `create()` before load_metadata). Return an empty
+            # map WITHOUT caching, so the real table is picked up once it exists.
+            return {}
+        mapping: dict[int, str] = {}
+        for text, idx in zip(self.tasks.index, self.tasks["task_index"].to_numpy()):
+            key = int(idx)
+            if key in mapping:
+                raise ValueError(
+                    f"Duplicate task_index {key} in {self.root}/meta/tasks.parquet: "
+                    f"{mapping[key]!r} and {text!r}. The string table must be a "
+                    f"bijection; rebuild it with tools/merge_b1k_cot_labels.py."
+                )
+            mapping[key] = text
+        self._task_text_by_index = mapping
+        return mapping
+
+    def lookup_task_text(self, task_index: int) -> str | None:
+        """O(1) task_index -> string. Returns None for an index absent from the table."""
+        return self.task_text_by_index.get(int(task_index))
+
+    def _invalidate_task_text_cache(self) -> None:
+        self._task_text_by_index = None
+
     def save_episode_tasks(self, tasks: list[str]):
         if len(set(tasks)) != len(tasks):
             raise ValueError(f"Tasks are not unique: {tasks}")
@@ -319,6 +405,7 @@ class LeRobotDatasetMetadata:
 
         if len(new_tasks) > 0:
             # Update on disk
+            self._invalidate_task_text_cache()
             write_tasks(self.tasks, self.root)
 
     def _save_episode_metadata(self, episode_dict: dict) -> None:
@@ -893,10 +980,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             _meta = {
                 'episode_index', 'frame_index', 'timestamp', 'task_index', 'index',
                 'coarse_task_index', 'operating_hand_index', 'subtask_annotation',
-                'atomic_task_index', 'plan_index', 'memory_index', 'prev_memory_index',
                 'scene_annotation',
-                'bbox_index', 'action_hint_index', '2d_trace_index',
-            }
+            } | {k for k, _, _ in _INDEXED_ANNOTATION_FIELDS}
             _needed = _meta | set(self.delta_timestamps.keys())
             columns = [c for c in columns if c in _needed]
 
@@ -924,13 +1009,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         # Determine which columns are actually needed
         # Core metadata + all optional scalar columns referenced by __getitem__
+        # Includes every indexed-string annotation column, so in_memory mode keeps
+        # the CoT annotations addressable (the old literal set omitted
+        # 2d_trace_index, silently disabling trace CoT under in_memory=True).
         _META_COLS = {
             'episode_index', 'frame_index', 'timestamp', 'task_index', 'index',
             'coarse_task_index', 'operating_hand_index', 'subtask_annotation',
-            'atomic_task_index', 'plan_index', 'memory_index', 'prev_memory_index',
             'scene_annotation',
-            'bbox_index', 'action_hint_index',
-        }
+        } | {k for k, _, _ in _INDEXED_ANNOTATION_FIELDS}
         needed = set(_META_COLS)
         if self.delta_timestamps is not None:
             needed |= set(self.delta_timestamps.keys())
@@ -1325,83 +1411,28 @@ class LeRobotDataset(torch.utils.data.Dataset):
             operating_hand_index = item["operating_hand_index"].item()
             item["operating_hand"] = self.meta.tasks.iloc[operating_hand_index].name
 
+        # ------------------------------------------------------------------
+        # Indexed-string annotations: <field>_index -> item["<field>"]
+        # ------------------------------------------------------------------
+        # Every one of these columns stores an int index into meta/tasks.parquet,
+        # whose DataFrame index holds the annotation string. `_decode_indexed`
+        # resolves them through MetaData.lookup_task_text, an O(1) dict built once
+        # per metadata object (the old `tasks[tasks.task_index == i]` form scanned
+        # the whole table per field per sample).
+        #
+        # NOTE on naming: BaseLerobotDataset.__getitem__ forwards annotation keys to
+        # the processor with `if "observation" not in key and "action" not in key`.
+        # Any decoded field whose name contains those substrings is silently dropped
+        # before it reaches SamplesBuilder, so new fields must avoid them.
+        #
         # Only handle atomic_task_index -> item["atomic_task"] for
         # r1lite/r1pro _merged_final_v30 here. robocoin's
         # subtask_annotation -> atomic_task decoding lives in the
         # RobocoinLerobotDatasetV3 subclass
         # (src/g05/data/robocoin/robocoin_lerobot_dataset.py), not in the generic
         # LeRobot loader.
-        if "atomic_task_index" in item and item["atomic_task_index"] is not None:
-            atomic_task_index = item["atomic_task_index"].item()
-            filtered = self.meta.tasks[self.meta.tasks["task_index"] == int(atomic_task_index)]
-            item["atomic_task"] = filtered.index[0] if len(filtered) > 0 else ""
-
-        # to support plan input (plan_index → full plan string from tasks_new.jsonl)
-        if "plan_index" in item and item["plan_index"] is not None:
-            import pandas as pd
-
-            plan_idx_raw = item["plan_index"]
-            if hasattr(plan_idx_raw, "item"):
-                plan_idx_raw = plan_idx_raw.item()
-            if plan_idx_raw is not None and not pd.isna(plan_idx_raw):
-                plan_idx = int(plan_idx_raw)
-                filtered = self.meta.tasks[self.meta.tasks["task_index"] == plan_idx]
-                item["plan"] = filtered.index[0] if len(filtered) > 0 else ""
-
-        # to support memory-based VLM training (memory_index / prev_memory_index from v21 data)
-        if "memory_index" in item and item["memory_index"] is not None:
-            memory_idx = item["memory_index"].item()
-            filtered = self.meta.tasks[self.meta.tasks["task_index"] == int(memory_idx)]
-            item["memory_update"] = filtered.index[0] if len(filtered) > 0 else ""
-
-        if "prev_memory_index" in item and item["prev_memory_index"] is not None:
-            prev_mem_idx = item["prev_memory_index"].item()
-            filtered = self.meta.tasks[self.meta.tasks["task_index"] == int(prev_mem_idx)]
-            item["memory"] = filtered.index[0] if len(filtered) > 0 else ""
-
-        # to support bbox CoT (bbox_index → JSON string {"obj_name": [x1,y1,x2,y2]})
-        if "bbox_index" in item and item["bbox_index"] is not None:
-            import pandas as _pd
-            bbox_idx_raw = item["bbox_index"]
-            if hasattr(bbox_idx_raw, "item"):
-                bbox_idx_raw = bbox_idx_raw.item()
-            if bbox_idx_raw is not None and not (isinstance(bbox_idx_raw, float) and _pd.isna(bbox_idx_raw)):
-                bbox_idx = int(bbox_idx_raw)
-                filtered = self.meta.tasks[self.meta.tasks["task_index"] == bbox_idx]
-                item["bbox"] = filtered.index[0] if len(filtered) > 0 else None
-
-        # to support action hint CoT (action_hint_index → natural language gripper motion text)
-        if "action_hint_index" in item and item["action_hint_index"] is not None:
-            import pandas as _pd
-            ah_idx_raw = item["action_hint_index"]
-            if hasattr(ah_idx_raw, "item"):
-                ah_idx_raw = ah_idx_raw.item()
-            if ah_idx_raw is not None and not (isinstance(ah_idx_raw, float) and _pd.isna(ah_idx_raw)):
-                ah_idx = int(ah_idx_raw)
-                filtered = self.meta.tasks[self.meta.tasks["task_index"] == ah_idx]
-                item["action_hint"] = filtered.index[0] if len(filtered) > 0 else None
-
-        # to support 2D trace CoT (2d_trace_index → JSON string with uv_left/uv_right gripper positions)
-        if "2d_trace_index" in item and item["2d_trace_index"] is not None:
-            import pandas as _pd
-            trace_idx_raw = item["2d_trace_index"]
-            if hasattr(trace_idx_raw, "item"):
-                trace_idx_raw = trace_idx_raw.item()
-            if trace_idx_raw is not None and not (isinstance(trace_idx_raw, float) and _pd.isna(trace_idx_raw)):
-                trace_idx = int(trace_idx_raw)
-                filtered = self.meta.tasks[self.meta.tasks["task_index"] == trace_idx]
-                item["trace_2d"] = filtered.index[0] if len(filtered) > 0 else None
-
-        # to support high level instruction
-        if (
-            "high_level_instruction_index" in item
-            and item["high_level_instruction_index"] is not None
-        ):
-            high_level_instruction_index = item["high_level_instruction_index"].item()
-            filtered = self.meta.tasks[
-                self.meta.tasks["task_index"] == int(high_level_instruction_index)
-            ]
-            item["high_level_instruction"] = filtered.index[0] if len(filtered) > 0 else ""
+        for index_key, out_key, missing in _INDEXED_ANNOTATION_FIELDS:
+            self._decode_indexed(item, index_key, out_key, missing)
 
         # quality_index disabled — always treat as qualified
         # if "quality_index" in item and item["quality_index"] is not None:
@@ -1411,6 +1442,44 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # else:
         item["step_is_qualified"] = True
         return item
+
+    # ------------------------------------------------------------------
+    # Indexed-string annotation decoding
+    # ------------------------------------------------------------------
+
+    def _decode_indexed(self, item: dict, index_key: str, out_key: str, missing):
+        """Resolve item[index_key] (an int index into meta/tasks) into item[out_key].
+
+        `missing` is the value written when the column is present but the row
+        carries no annotation (NaN / sentinel -1). Use "" for fields whose builders
+        treat empty string as "absent" and None for JSON payload fields.
+
+        An index that is present and well-formed but absent from the string table is
+        a data-integrity error and raises, rather than silently training on "".
+        """
+        import pandas as _pd
+
+        raw = item.get(index_key)
+        if raw is None:
+            return
+        if hasattr(raw, "numel") and raw.numel() != 1:
+            raise ValueError(
+                f"{index_key} must be a scalar per frame, got shape {tuple(raw.shape)}. "
+                f"Chunked annotation columns are not supported by _decode_indexed."
+            )
+        if hasattr(raw, "item"):
+            raw = raw.item()
+        if raw is None or (isinstance(raw, float) and _pd.isna(raw)) or int(raw) < 0:
+            item[out_key] = missing
+            return
+        text = self.meta.lookup_task_text(int(raw))
+        if text is None:
+            raise KeyError(
+                f"{index_key}={int(raw)} is not present in {self.meta.root}/meta/tasks.parquet "
+                f"(table has {len(self.meta.task_text_by_index)} entries). The data parquet and "
+                f"the string table are out of sync; rebuild with tools/merge_b1k_cot_labels.py."
+            )
+        item[out_key] = text
 
     def __repr__(self):
         feature_keys = list(self.features)
