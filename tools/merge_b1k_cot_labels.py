@@ -151,6 +151,9 @@ class DatasetGeometry:
     #: episode_index -> (dataset_from_index, dataset_to_index) — a half-open
     #: global row range. Row `dataset_from_index + k` is frame_index `k`.
     ranges: Dict[int, Tuple[int, int]]
+    #: raw_episode_id (the demo_id the sidecars and cot_targets key on, e.g. 450010)
+    #: -> episode_index. Empty when the episodes table has no raw_episode_id column.
+    raw_to_episode: Dict[int, int] = field(default_factory=dict)
 
     def length(self, episode: int) -> int:
         lo, hi = self.ranges[episode]
@@ -176,11 +179,16 @@ def read_geometry(root: Path) -> DatasetGeometry:
         int(r.episode_index): (int(r.dataset_from_index), int(r.dataset_to_index))
         for r in eps.itertuples()
     }
+    raw_to_episode = (
+        {int(r.raw_episode_id): int(r.episode_index) for r in eps.itertuples()}
+        if "raw_episode_id" in eps.columns else {}
+    )
     return DatasetGeometry(
         root=root,
         fps=float(info["fps"]),
         total_frames=int(info["total_frames"]),
         ranges=ranges,
+        raw_to_episode=raw_to_episode,
     )
 
 
@@ -454,6 +462,7 @@ class AlignmentStats:
     per_label: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     staleness: Dict[str, List[int]] = field(default_factory=lambda: defaultdict(list))
     dropped_stale: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    dropped_trailing: int = 0
 
 
 def align_episode(
@@ -471,6 +480,12 @@ def align_episode(
     an index into `ordered` (the per-label list of distinct payload strings in
     source order), resolved to a global string-table index by the caller.
     """
+    # bbox_replay emits N+1 records for N actions: "the final observation (state N)
+    # has no matching action and is emitted as one extra record". Drop exactly that
+    # record; anything further out is still a hard error.
+    if length in frame_payloads:
+        frame_payloads = {f: v for f, v in frame_payloads.items() if f != length}
+        stats.dropped_trailing += 1
     annotated = sorted(frame_payloads)
     for frame in annotated:
         if not 0 <= frame < length:
@@ -555,6 +570,22 @@ def merge(
     log(f"dataset : {dataset}")
     log(f"          fps={geom.fps} frames={geom.total_frames} episodes={len(geom.ranges)}")
 
+    # Both label sources key episodes by raw_episode_id (the demo_id, e.g. 450010),
+    # a different namespace from LeRobot's episode_index. Remap through
+    # meta/episodes when the keys are not already episode indices.
+    if rows and not set(rows) <= set(geom.ranges) and geom.raw_to_episode:
+        remapped: SourceRows = {}
+        unmapped = []
+        for key, frames in rows.items():
+            ep = geom.raw_to_episode.get(int(key))
+            if ep is None:
+                unmapped.append(int(key)); continue
+            if ep in remapped:
+                raise ValueError(f"two source episodes map to episode_index {ep}")
+            remapped[ep] = frames
+        log(f"remapped {len(remapped)} source episode(s) raw_episode_id -> episode_index"
+            + (f"; {len(unmapped)} not in this dataset (skipped): {unmapped[:5]}" if unmapped else ""))
+        rows = remapped
     unknown = sorted(set(rows) - set(geom.ranges))
     if unknown:
         raise KeyError(
@@ -601,6 +632,8 @@ def merge(
             columns[column][lo : lo + length][hit] = table_index[local[hit]]
 
     log("")
+    if stats.dropped_trailing:
+        log(f"dropped {stats.dropped_trailing} trailing action-less sidecar record(s) (frame == episode length)")
     log("alignment")
     for label, column, mode in LABEL_FIELDS:
         n = stats.per_label[label]
