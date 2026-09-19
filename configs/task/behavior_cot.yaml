@@ -23,6 +23,17 @@ defaults:
 - _self_
 
 model:
+  # DDP must tolerate parameters that receive no gradient. With
+  # continuous_action=false, G05Model.forward never calls fm_helper.train_step, so
+  # the flow-matching action expert's parameters are absent from the autograd graph
+  # and DDP (find_unused_parameters=false, the configs/model/g05.yaml default) raises
+  # "Expected to have finished reduction in the prior iteration" on the SECOND step.
+  # Upstream avoided this by computing the FM loss and multiplying it by zero, which
+  # keeps those params in the graph at the full cost of the FM forward. Flagging them
+  # as unused instead is what libero / libero_ar / bridge / robotwin / so100 already
+  # do. Baseline behavior.yaml keeps the default: its FM head does receive gradient.
+  find_unused_parameters: true
+
   model_arch:
     # ---- AR-only -----------------------------------------------------------
     # BEHAVIOR CoT is a pure autoregressive policy: reasoning tokens, then <EOV>,

@@ -112,6 +112,16 @@ prefix-KV rebuild, time/noise sampling and forward pass never execute and
 Continuous robot actions are obtained by **`ActionCodec.decode(action_tokens)`**,
 not by flow matching.
 
+**DDP requirement that follows from skipping FM.** Because the flow head's parameters
+never enter the autograd graph when `continuous_action=false`, DDP with the default
+`find_unused_parameters=false` raises *"Expected to have finished reduction in the prior
+iteration"* on the **second** optimizer step (a one-step smoke test will not catch it).
+`behavior_cot.yaml` therefore sets `model.find_unused_parameters: true`, the same setting
+`libero` / `libero_ar` / `bridge` / `robotwin` / `so100` use. Upstream's `fm_loss * 0`
+avoided this only by paying for the full FM forward. A cleaner alternative — freezing the
+FM parameters (`requires_grad=False`) when `continuous_action=false` — is a code change
+not yet made.
+
 Metrics: `train/cot_accuracy` and `train/action_token_accuracy` split by token-ID
 range in `ar_helper.py`. Note `cot_accuracy` covers *all* non-action supervised
 tokens, so it includes the separators, `Action: ` and `<EOV>` and is optimistically
