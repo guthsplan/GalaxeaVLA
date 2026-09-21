@@ -11,7 +11,8 @@ Two independent checks, neither of which needs a GPU or a dataset.
    and drives `forward` far enough to prove it is never reached — and, with
    `continuous_action=True`, that it still *is*.
 
-2. **AR-only config.** `behavior_cot` resolves with discrete_action=True,
+2. **AR-only config.** every CoT config (`behavior_cot`, `behavior_cot_v2` and its
+   _single/_pairs/_full ablations) resolves with discrete_action=True,
    continuous_action=False, return_continuous_action=False, predict_cot=True,
    pred_eov=True; and `behavior` keeps its original settings.
 
@@ -153,24 +154,44 @@ def main() -> int:
 
     print()
     print("=" * 72)
-    print("3. behavior_cot resolves AR-only; behavior baseline unchanged")
+    print("3. every CoT task config resolves AR-only; behavior baseline unchanged")
     print("=" * 72)
     os.environ.setdefault("B1K_SUBSET_DIR", "data/b1k_5task_lerobot")
     from resolve_config import resolve_task_config
 
-    cot = resolve_task_config("behavior_cot").model.model_arch
-    for key, want in (
-        ("discrete_action", True),
-        ("continuous_action", False),
-        ("return_continuous_action", False),
-        ("predict_cot", True),
+    # Every config that trains CoT must be AR-only, not just the v1 one: a config
+    # left with continuous_action=True would silently train the flow-matching expert
+    # and, worse, one left with find_unused_parameters=False dies on DDP step 2.
+    # The v2 ablations inherit from behavior_cot_v2 but are listed explicitly so a
+    # future edit to any single file cannot quietly drop the invariant.
+    for task in (
+        "behavior_cot",
+        "behavior_cot_v2",
+        "behavior_cot_v2_single",
+        "behavior_cot_v2_pairs",
+        "behavior_cot_v2_full",
     ):
-        check(f"behavior_cot.{key} == {want}", cot.get(key) == want, repr(cot.get(key)))
-    check(
-        "behavior_cot.input_preprocessor.pred_eov == True",
-        cot.input_preprocessor.pred_eov is True,
-        repr(cot.input_preprocessor.pred_eov),
-    )
+        resolved = resolve_task_config(task)
+        cot = resolved.model.model_arch
+        for key, want in (
+            ("discrete_action", True),
+            ("continuous_action", False),
+            ("return_continuous_action", False),
+            ("predict_cot", True),
+        ):
+            check(f"{task}.{key} == {want}", cot.get(key) == want, repr(cot.get(key)))
+        check(
+            f"{task}.input_preprocessor.pred_eov == True",
+            cot.input_preprocessor.pred_eov is True,
+            repr(cot.input_preprocessor.pred_eov),
+        )
+        # Skipping the FM forward removes those params from the autograd graph, so
+        # DDP must be told to expect it. Without this the run fails on step 2.
+        check(
+            f"{task}.find_unused_parameters == True",
+            resolved.model.get("find_unused_parameters") is True,
+            repr(resolved.model.get("find_unused_parameters")),
+        )
 
     base = resolve_task_config("behavior").model.model_arch
     for key, want in (
