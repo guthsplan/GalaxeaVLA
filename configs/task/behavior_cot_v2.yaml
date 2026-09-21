@@ -145,5 +145,32 @@ model:
       eval_builder:
         _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder
 
+tokenizer:
+  vq_config:
+    # ---- gripper no-op dropout: DISABLED -----------------------------------
+    # behavior.yaml sets `rule_based_key_patterns: [gripper]`, which combines with
+    # `dropout_noop_parts: true` to drop a gripper group from the AR targets whenever
+    # its BINARIZED value is constant across the 32-step chunk
+    # (tokenizer/interface/vq_base.py:390-399 -- `binarized == binarized[0:1]` -> noop),
+    # open or closed alike. Measured on b1k_task045_cot_v2 (200 ep, H=32):
+    #
+    #     left_gripper  token present in  1.36% of chunks (98.64% dropped)
+    #     right_gripper token present in  2.72% of chunks (97.28% dropped)
+    #     4 left / 8 right transitions per episode
+    #
+    # So the model was supervised to emit a gripper token almost nowhere, and in v1
+    # eval it correspondingly emitted `left_gripper` 0 times and `right_gripper` in
+    # ~1-3% of 858 model calls. `cook_hot_dogs` cannot be satisfied without closing
+    # the gripper, so every rollout timed out at q_score 0.0 regardless of the CoT
+    # configuration. See README_COT_V2.md section 2.2.
+    #
+    # Emptying the pattern list is the surgical fix: `_is_rule_based_key` then returns
+    # False for every key, so the constant-detection branch never fires, while the
+    # other two noop sources are untouched -- `action_op_mask` all-False (inert here:
+    # behavior.yaml's DummyActionFilter marks every dim operational) and
+    # `action_dim_is_pad` all-True (legitimate cross-embodiment padding). Preferred
+    # over `dropout_noop_parts: false`, which would also discard that padding path.
+    rule_based_key_patterns: []
+
 logger:
   project: ${oc.env:WANDB_PROJECT,g05-behavior-cot}
