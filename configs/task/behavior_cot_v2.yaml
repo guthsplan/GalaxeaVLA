@@ -1,0 +1,149 @@
+# @package _global_
+# G0.5 CoT post-training on BEHAVIOR 2026 — G0.5-style mixed CoT targets, AR-only.
+#
+# Inherits everything from `behavior.yaml` (optimiser, 27-D grouped action layout,
+# single-frame obs, ActionCodec settings, data config) and changes only what CoT
+# supervision and the AR-only objective require. The no-CoT baseline
+# `behavior.yaml` is untouched and keeps working exactly as before:
+#
+#     bash scripts/run/finetune.sh 1 behavior      --dry-run   # baseline, unchanged
+#     bash scripts/run/finetune.sh 1 behavior_cot      --dry-run   # CoT v1 (BeliefGraph-conditioned), unchanged
+#     bash scripts/run/finetune.sh 1 behavior_cot_v2   --dry-run   # this config
+#
+# Sequence this config trains (qwen35-base resolution):
+#
+#   <images> Embodiment: ...; Task: ... State: <proprio>;
+#   <prompt masked>
+#   <EOC> <one CoT target> | Action: <EOV> <ActionCodec RVQ tokens> | <eos>
+#   |<------- conditioning, no loss ------->|<--------- single AR CE --------->|
+#
+# There is NO `BeliefGraph:` conditioning input any more. The belief graph survives only as
+# auxiliary CoT *targets* (Delta:/Belief:/Observe:/Effect:), exactly like upstream G0.5's
+# Subtask/BBox targets: the conditioning segment is the plain no-CoT prompt, so inference
+# needs no external belief module, no operator/goal artifacts and no simulator-derived input.
+# (The previous protocol conditioned on a GT-derived `bg_known`, which had to be re-estimated
+# by the model at eval time — a train/eval mismatch. See experiments/behavior/COT.md.)
+#
+# Continuous robot actions come from ActionCodec.decode() on those discrete tokens,
+# NOT from flow matching. See the AR-only block below.
+defaults:
+- behavior
+- _self_
+
+model:
+  # DDP must tolerate parameters that receive no gradient. With
+  # continuous_action=false, G05Model.forward never calls fm_helper.train_step, so
+  # the flow-matching action expert's parameters are absent from the autograd graph
+  # and DDP (find_unused_parameters=false, the configs/model/g05.yaml default) raises
+  # "Expected to have finished reduction in the prior iteration" on the SECOND step.
+  # Upstream avoided this by computing the FM loss and multiplying it by zero, which
+  # keeps those params in the graph at the full cost of the FM forward. Flagging them
+  # as unused instead is what libero / libero_ar / bridge / robotwin / so100 already
+  # do. Baseline behavior.yaml keeps the default: its FM head does receive gradient.
+  find_unused_parameters: true
+
+  model_arch:
+    # ---- AR-only -----------------------------------------------------------
+    # BEHAVIOR CoT is a pure autoregressive policy: reasoning tokens, then <EOV>,
+    # then ActionCodec RVQ action tokens, all in one next-token CE. The flow
+    # matching action head is not trained and not used at inference.
+    #   discrete_action=true          -> ActionCodec tokens are AR targets
+    #   continuous_action=false       -> G05Model.forward skips fm_helper.train_step
+    #                                    entirely (not "multiply by zero"), and
+    #                                    G05Policy.generate_action skips inference_fm
+    #   return_continuous_action=false-> no continuous head output is requested
+    # Actions are recovered with ActionCodec.decode(action_tokens).
+    discrete_action: true
+    continuous_action: false
+    return_continuous_action: false
+
+    # ---- CoT ---------------------------------------------------------------
+    # Required for CoT training. Three distinct effects, all verified in code:
+    #  1. g05_policy.py:695  — keeps CE loss alive (skip_ce_loss is False)
+    #  2. g05_policy.py:711  — pushes cot_accuracy into the accumulator, so
+    #                          finetune.py:1253 logs `train/cot_accuracy`
+    #  3. g05_policy.py:1028 — at inference, runs an AR generate pass that stops
+    #                          at EOV before handing off to action decoding
+    predict_cot: true
+
+    # NOT changed from the baseline: `action_attend_cot` (configs/model/g05.yaml:240)
+    # is declared but referenced by zero Python in this tree — it is inert config.
+    # Left at its default rather than toggled, since flipping it would imply a
+    # behaviour change that does not exist.
+
+    input_preprocessor:
+      # Required. input_preprocessor.py:814-823 builds the <EOV> segment with
+      # `masked = not pred_eov`. With pred_eov=false the EOV token is masked out of
+      # the labels, so the model never learns to emit the reasoning -> action
+      # transition it must generate at inference time.
+      pred_eov: true
+
+  processor:
+    # Training-time CoT selection. MixedSamplesBuilder (samples_builder.py) already
+    # implements exactly the required policy:
+    #   1. filter candidates by can_handle(data)  — a sample missing an annotation
+    #      simply drops that candidate
+    #   2. random.choices over the *applicable* subset, by weight
+    #   3. if nothing is applicable, fall back to BaseSamplesBuilder (no CoT)
+    # so there is no second selection mechanism anywhere in this change.
+    #
+    # `_recursive_: false` stops Hydra instantiating the candidate dicts; the
+    # builder resolves each `_target_` itself via pydoc.locate.
+    #
+    # Candidates = upstream G0.5 builders that our labels can feed (atomic_task from the
+    # challenge skill annotations, bbox from the CoT extractor) plus the four belief-graph
+    # targets. None of them takes a `BeliefGraph:` input. A candidate whose label is absent
+    # on a frame is skipped by can_handle(); weights are renormalised over the applicable
+    # subset, so the empirical mix follows label coverage as well as these numbers.
+    #   AtomicTaskBaseSamplesBuilder : NO CoT, and `Task:` carries the atomic_task instead of
+    #                                  the full instruction (task -> action at skill level)
+    #   SubtaskCoTBuilder            : Subtask: <atomic_task>
+    #   BBoxCoTBuilder               : BBox: ...            (needs bbox labels)
+    #   BBoxSubtaskCoTBuilder        : BBox: ... | Subtask: ...   (needs bbox labels)
+    #   Trace2DCoTBuilder            : Trace: 2D gripper trace   (needs 2d_trace labels with at
+    #                                  least one arm visible)
+    #   DeltaCoTBuilder              : Delta:   remaining goal count lines
+    #   UpdateCoTBuilder             : Belief:  current belief summary
+    #   ObserveCoTBuilder            : Observe: visible predicates (perception)
+    #   EffectCoTBuilder             : Effect:  predicate changes of the next skill
+    #   ObserveUpdateCoTBuilder      : Observe: ... | Belief: ...     (perception -> state)
+    #   SubtaskEffectCoTBuilder      : Subtask: ... | Effect: ...     (plan -> consequence)
+    #   FullBeliefCoTBuilder         : Observe: | Belief: | Delta: | Effect:   (all four, one span)
+    # Ablations of this mix: behavior_cot_v2_{single,pairs,full}.yaml.
+    # Override per run, e.g.:
+    #   model.processor.samples_builder.candidates.0.weight=5
+    samples_builder:
+      _target_: g05.data_processor.processor.samples_builder.MixedSamplesBuilder
+      _partial_: true
+      _recursive_: false
+      candidates:
+      - _target_: g05.data_processor.processor.samples_builder.AtomicTaskBaseSamplesBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.BBoxSubtaskCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.BBoxCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.Trace2DCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.DeltaCoTBuilder
+        weight: 0.5
+      - _target_: g05.data_processor.processor.samples_builder.UpdateCoTBuilder
+        weight: 0.5
+      - _target_: g05.data_processor.processor.samples_builder.ObserveCoTBuilder
+        weight: 0.5
+      - _target_: g05.data_processor.processor.samples_builder.EffectCoTBuilder
+        weight: 0.5
+      - _target_: g05.data_processor.processor.samples_builder.FullBeliefCoTBuilder
+        weight: 0.2   
+      - _target_: g05.data_processor.processor.samples_builder.ObserveUpdateCoTBuilder
+        weight: 0.4
+      - _target_: g05.data_processor.processor.samples_builder.SubtaskEffectCoTBuilder
+        weight: 0.4
+
+      eval_builder:
+        _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder
+
+logger:
+  project: ${oc.env:WANDB_PROJECT,g05-behavior-cot}

@@ -1,0 +1,39 @@
+# @package _global_
+# Ablation plan B of behavior_cot_v2.yaml: identical in every respect EXCEPT the candidate
+# list — single-field targets + the two paired spans (Observe|Belief, Subtask|Effect).
+# Per-candidate weights are copied from behavior_cot_v2.yaml (which mixes A + B + C); weights are
+# renormalised over the applicable candidates, so dropping some raises the others' share.
+#
+#     TASK_CONFIG=behavior_cot_v2_pairs bash scripts/train_g05_cot.sh <EXP> ...
+#
+# Hydra replaces lists wholesale, so the candidates are repeated here verbatim.
+defaults:
+- behavior_cot_v2
+- _self_
+
+model:
+  processor:
+    samples_builder:
+      candidates:
+      - _target_: g05.data_processor.processor.samples_builder.AtomicTaskBaseSamplesBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.BBoxSubtaskCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.BBoxCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.Trace2DCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.DeltaCoTBuilder
+        weight: 0.5
+      - _target_: g05.data_processor.processor.samples_builder.UpdateCoTBuilder
+        weight: 0.5
+      - _target_: g05.data_processor.processor.samples_builder.ObserveCoTBuilder
+        weight: 0.5
+      - _target_: g05.data_processor.processor.samples_builder.EffectCoTBuilder
+        weight: 0.5
+      - _target_: g05.data_processor.processor.samples_builder.ObserveUpdateCoTBuilder
+        weight: 0.4
+      - _target_: g05.data_processor.processor.samples_builder.SubtaskEffectCoTBuilder
+        weight: 0.4

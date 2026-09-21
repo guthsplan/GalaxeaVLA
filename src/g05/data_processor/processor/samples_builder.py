@@ -10,12 +10,15 @@ Existing builders:
 - SubtaskCoTBuilder:               subtask CoT
 - BBoxCoTBuilder:                  bbox CoT target
 - MemorySamplesBuilder:            memory input
-- BeliefGraphBuilder:              belief-graph conditioning input (BEHAVIOR bgdata pipeline)
-- BeliefGraph{Delta,Update,Effect,Subtask}CoTBuilder:
-                                   BG input + Delta:/Belief:/Effect:/Subtask: CoT
-- BeliefGraphObserveCoTBuilder:    Observe: CoT (model-as-estimator; no bg_known input)
-- BeliefGraph{BBox,Trace2D}CoTBuilder:
-                                   BG input + bbox / 2D-trace CoT (BEHAVIOR addition)
+- BeliefGraph*Builder:             LEGACY CoT v1 — same targets but conditioned on a `BeliefGraph:`
+                                   input slot (configs/task/behavior_cot.yaml); kept for v1 checkpoints
+- {ObserveUpdate,SubtaskEffect,FullBelief}CoTBuilder:
+                                   the same belief-graph targets, several per generative span
+- {Delta,Update,Effect,Observe}CoTBuilder:
+                                   belief-graph CoT TARGETS (Delta:/Belief:/Effect:/Observe:) from the
+                                   BEHAVIOR bgdata pipeline. Output-only: no builder takes a
+                                   `BeliefGraph:` conditioning input, so the prompt is identical to the
+                                   no-CoT prompt and evaluation needs no external belief module.
 
 Adding a builder takes only 3 steps:
 
@@ -791,6 +794,226 @@ class PlanStepCoTBuilder(BaseSamplesBuilder):
         samples["plan"] = plan
         samples["plan_step"] = f"Step: {current_step}" if current_step else ""
         samples["cotprefix"] = "Please output the current plan step:"
+
+
+def _strip_cot_prefix(text: str, prefix: str) -> str:
+    """Idempotent prefixing: 'Delta: none' and 'none' both serialize identically."""
+    text = (text or "").strip()
+    if text.lower().startswith(prefix.lower() + ":"):
+        text = text[len(prefix) + 1 :].strip()
+    return text
+
+
+class DeltaCoTBuilder(BaseSamplesBuilder):
+    """Remaining-goal (Delta:) CoT output. v2 counterpart of the legacy BeliefGraphDeltaCoTBuilder.
+
+    The model restates the unsatisfied goal count lines before acting. The belief graph
+    is an auxiliary prediction TARGET only: there is no `BeliefGraph:` conditioning input,
+    so the conditioning segment is exactly the no-CoT one and nothing has to be supplied
+    at inference.
+
+    Data source (lerobot_dataset_v3.py):
+        data["bg_delta"] <- bg_delta_index, e.g. "(cooked ?x) 0/2 [hotdog.n.02]"
+                            ('Delta:' prefix optional — added idempotently)
+
+    Template (embodiment=r1, 2 cameras, discrete):
+        <image0_image_!><image1_image_!><bos>Embodiment: <embodiment_text_!>; Task: <command_text_!_200> State: <proprio_proprio_!>;
+        <prompt_text_!>\n<EOC><bg_delta_text>|
+        Action: <EOV><action_action>|<eos>
+    """
+
+    required_fields = ("bg_delta",)
+    eval_required_fields = ()
+
+    _COT_FIELD = "bg_delta"
+    _COT_PREFIX = "Delta"
+    _COT_PROMPT = "predict remaining goal predicates"
+
+    @property
+    def template(self) -> str:
+        return (
+            "<chat_user_prefix>" + self._images + "<bos>"
+            "Embodiment: <embodiment_text_!>; Task: <command_text_!_200> State: <proprio_proprio_!>;"
+            "<chat_user_suffix><chat_assistant_prefix>"
+            f"<prompt_text_!>\n<EOC><{self._COT_FIELD}_text>|"
+            "Action: <EOV><action_action>|<eos>"
+        )
+
+    def _populate_extra_samples(self, data, samples):
+        body = _strip_cot_prefix(str(data.get(self._COT_FIELD, "") or ""), self._COT_PREFIX)
+        samples[self._COT_FIELD] = f"{self._COT_PREFIX}: {body}"
+        samples["prompt"] = self._COT_PROMPT
+
+
+class UpdateCoTBuilder(DeltaCoTBuilder):
+    """Updated-belief (Belief:) CoT output. v2 counterpart of the legacy BeliefGraphUpdateCoTBuilder.
+
+    The CoT target is the current-frame belief summary, teaching the model to maintain a
+    symbolic scene state from the images alone (no previous-belief input).
+
+    Data source (lerobot_dataset_v3.py):
+        data["bg_belief"] <- bg_belief_index, e.g.
+            "(inhand hotdog_207) 0.97 obs | (open fridge) 0.97 mem"
+    """
+
+    required_fields = ("bg_belief",)
+    eval_required_fields = ()
+
+    _COT_FIELD = "bg_belief"
+    _COT_PREFIX = "Belief"
+    _COT_PROMPT = "predict updated belief graph"
+
+
+class EffectCoTBuilder(DeltaCoTBuilder):
+    """Symbolic-effect (Effect:) CoT output. v2 counterpart of the legacy BeliefGraphEffectCoTBuilder.
+
+    The target is the predicate changes the imminent skill will cause, grounded
+    from the operator library (bgdata/operators.py), e.g. "(open fridge) 1>0".
+    Ties action prediction to its symbolic postcondition.
+
+    Data source (lerobot_dataset_v3.py):
+        data["bg_effect"] <- bg_effect_index
+    """
+
+    required_fields = ("bg_effect",)
+    eval_required_fields = ()
+
+    _COT_FIELD = "bg_effect"
+    _COT_PREFIX = "Effect"
+    _COT_PROMPT = "predict symbolic effect of the next skill"
+
+
+class ObserveCoTBuilder(DeltaCoTBuilder):
+    """Visible-predicate (Observe:) CoT output. v2 counterpart of the legacy BeliefGraphObserveCoTBuilder.
+
+    The target is the set of predicates VISIBLE at this frame with their values
+    ("(open fridge) 1 | (inside hotdog_207 fridge) 1 | (cooked hotdog_207) 0"),
+    supervised by the visibility-masked labels of the bgdata pipeline — a pure
+    perception target. Robot-tag predicates (inhand/reachable/visited) are excluded.
+
+    Data source (lerobot_dataset_v3.py):
+        data["bg_observe"] <- bg_observe_index looks up the tasks table
+                              ('Observe:' prefix optional — added idempotently)
+    """
+
+    required_fields = ("bg_observe",)
+    eval_required_fields = ()
+
+    _COT_FIELD = "bg_observe"
+    _COT_PREFIX = "Observe"
+    _COT_PROMPT = "predict visible predicates"
+
+
+class _MultiFieldCoTBuilder(BaseSamplesBuilder):
+    """Several CoT targets in ONE generative span: `<EOC><f1>|<f2>|...|Action: <EOV>...`.
+
+    Same contract as the single-field builders above (no `BeliefGraph:` input, every field is a
+    supervised target), but all listed fields are emitted for the same frame, in causal order,
+    so later fields are predicted conditioned on the earlier ones. Follows upstream's
+    two-slot builders (BBoxSubtaskCoTBuilder, SubtaskActionHintCoTBuilder).
+
+    can_handle() needs EVERY field, so a frame missing one label drops the whole builder —
+    keep the single-field builders as candidates alongside these.
+
+    Subclasses set:
+        _COT_FIELDS : ((data_key, prefix), ...) in emission order. data_key "atomic_task" is
+                      stored bare; the bg_* keys may already carry their prefix (idempotent).
+        _COT_PROMPT : masked instruction text
+    """
+
+    _COT_FIELDS: tuple = ()
+    _COT_PROMPT: str = ""
+
+    @property
+    def template(self) -> str:
+        slots = "".join(f"<{field}_text>|" for field, _ in self._COT_FIELDS)
+        return (
+            "<chat_user_prefix>" + self._images + "<bos>"
+            "Embodiment: <embodiment_text_!>; Task: <command_text_!_200> State: <proprio_proprio_!>;"
+            "<chat_user_suffix><chat_assistant_prefix>"
+            f"<prompt_text_!>\n<EOC>{slots}"
+            "Action: <EOV><action_action>|<eos>"
+        )
+
+    def _populate_extra_samples(self, data, samples):
+        for field, prefix in self._COT_FIELDS:
+            body = _strip_cot_prefix(str(data.get(field, "") or ""), prefix)
+            samples[field] = f"{prefix}: {body}"
+        samples["prompt"] = self._COT_PROMPT
+
+
+class ObserveUpdateCoTBuilder(_MultiFieldCoTBuilder):
+    """Perception -> state: `Observe: ...|Belief: ...|` then the action.
+
+    What is visible now, then the belief summary that follows from it.
+    """
+
+    required_fields = ("bg_observe", "bg_belief")
+    eval_required_fields = ()
+    _COT_FIELDS = (("bg_observe", "Observe"), ("bg_belief", "Belief"))
+    _COT_PROMPT = "predict visible predicates and updated belief graph"
+
+
+class SubtaskEffectCoTBuilder(_MultiFieldCoTBuilder):
+    """Plan -> consequence: `Subtask: ...|Effect: ...|` then the action.
+
+    The skill to execute, then the predicate changes that skill will cause. Both are short,
+    so the action tokens keep most of the sequence's loss mass.
+    """
+
+    required_fields = ("atomic_task", "bg_effect")
+    eval_required_fields = ()
+    _COT_FIELDS = (("atomic_task", "Subtask"), ("bg_effect", "Effect"))
+    _COT_PROMPT = "predict subtask and its symbolic effect"
+
+
+class FullBeliefCoTBuilder(_MultiFieldCoTBuilder):
+    """All four belief-graph targets in one span, causal order:
+    `Observe: ...|Belief: ...|Delta: ...|Effect: ...|` then the action.
+
+    Densest supervision per sample, but the longest CoT (Observe alone can run to ~13
+    predicates): the action tokens become a small fraction of the supervised span, and at
+    inference this builder is slow. Intended as a training-only ablation (plan C) against the
+    single-field (A) and paired (B) candidates; see configs/task/behavior_cot_v2*.yaml.
+    """
+
+    required_fields = ("bg_observe", "bg_belief", "bg_delta", "bg_effect")
+    eval_required_fields = ()
+    _COT_FIELDS = (
+        ("bg_observe", "Observe"),
+        ("bg_belief", "Belief"),
+        ("bg_delta", "Delta"),
+        ("bg_effect", "Effect"),
+    )
+    _COT_PROMPT = (
+        "predict visible predicates, updated belief graph, remaining goal predicates "
+        "and symbolic effect of the next skill"
+    )
+
+
+#: Candidates of configs/task/behavior_cot_v2.yaml, in config order (weights live in the config).
+BEHAVIOR_COT_V2_BUILDERS = (
+    AtomicTaskBaseSamplesBuilder,
+    BBoxSubtaskCoTBuilder,
+    SubtaskCoTBuilder,
+    BBoxCoTBuilder,
+    Trace2DCoTBuilder,
+    DeltaCoTBuilder,
+    UpdateCoTBuilder,
+    ObserveCoTBuilder,
+    EffectCoTBuilder,
+    FullBeliefCoTBuilder,
+    ObserveUpdateCoTBuilder,
+    SubtaskEffectCoTBuilder,
+)
+
+
+# ====================================================================================== #
+#  LEGACY — CoT protocol v1 (configs/task/behavior_cot.yaml, run g05_task045_cot_v2 and   #
+#  its checkpoints). These builders CONDITION on `BeliefGraph: <bg_known>`; they are kept #
+#  unchanged so v1 configs/checkpoints still load with the prompt they were trained on.   #
+#  New training should use the output-only v2 builders above (behavior_cot_v2.yaml).      #
+# ====================================================================================== #
 
 
 class BeliefGraphBuilder(BaseSamplesBuilder):

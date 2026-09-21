@@ -1,5 +1,13 @@
 # BEHAVIOR-1K 2026 — G0.5 CoT post-training (canonical BeliefGraph protocol, AR-only)
 
+> **CoT protocol v2 (2026-09) lives alongside this document's v1 protocol — see `README_COT_V2.md`
+> in the solution repo.** v2 = `configs/task/behavior_cot_v2.yaml`: the belief graph is an
+> output-only CoT target (no `BeliefGraph: <bg_known>` conditioning), builders
+> `Delta/Update/Observe/Effect/ObserveUpdate/SubtaskEffect/FullBelief CoTBuilder` plus upstream
+> `AtomicTaskBase/Subtask/BBox/BBoxSubtask/Trace2D`. Everything below describes **v1**
+> (`configs/task/behavior_cot.yaml`, the `BeliefGraph*` builders), which is kept unchanged so the
+> `g05_task045_cot_v2` checkpoints still load with the prompt they were trained on.
+
 This is the single current description of BEHAVIOR CoT training. Where an older
 document disagrees, this file wins; see **Obsolete** at the bottom for what was
 replaced.
