@@ -868,7 +868,7 @@ class EffectCoTBuilder(DeltaCoTBuilder):
     """Symbolic-effect (Effect:) CoT output. v2 counterpart of the legacy BeliefGraphEffectCoTBuilder.
 
     The target is the predicate changes the imminent skill will cause, grounded
-    from the operator library (bgdata/operators.py), e.g. "(open fridge) 1>0".
+    from the operator library (bgdata/operators.py), e.g. "(open fridge_dszchb_0) 1>0".
     Ties action prediction to its symbolic postcondition.
 
     Data source (lerobot_dataset_v3.py):
@@ -887,7 +887,7 @@ class ObserveCoTBuilder(DeltaCoTBuilder):
     """Visible-predicate (Observe:) CoT output. v2 counterpart of the legacy BeliefGraphObserveCoTBuilder.
 
     The target is the set of predicates VISIBLE at this frame with their values
-    ("(open fridge) 1 | (inside hotdog_207 fridge) 1 | (cooked hotdog_207) 0"),
+    ("(open fridge_dszchb_0) 1 | (inside hotdog_207 fridge_dszchb_0) 1 | (cooked hotdog_207) 0"),
     supervised by the visibility-masked labels of the bgdata pipeline — a pure
     perception target. Robot-tag predicates (inhand/reachable/visited) are excluded.
 
@@ -1161,7 +1161,7 @@ class BeliefGraphEffectCoTBuilder(BeliefGraphDeltaCoTBuilder):
     """Belief-graph input + symbolic-effect (Effect:) CoT output.
 
     The target is the predicate changes the imminent skill will cause, grounded
-    from the operator library (bgdata/operators.py), e.g. "(open fridge) 1>0".
+    from the operator library (bgdata/operators.py), e.g. "(open fridge_dszchb_0) 1>0".
     Ties action prediction to its symbolic postcondition.
 
     Data source (lerobot_dataset_v3.py):
@@ -1181,7 +1181,7 @@ class BeliefGraphObserveCoTBuilder(BaseSamplesBuilder):
     """Observe: CoT — the model AS the predicate estimator (perception only).
 
     The target is the set of predicates VISIBLE at this frame with their values
-    ("(open fridge) 1 | (inside hotdog_207 fridge) 1 | (cooked hotdog_207) 0"),
+    ("(open fridge_dszchb_0) 1 | (inside hotdog_207 fridge_dszchb_0) 1 | (cooked hotdog_207) 0"),
     supervised by the visibility-masked labels of the bgdata pipeline. Deliberately
     does NOT take bg_known conditioning: the observation must come from the images,
     not from the memory, so belief state cannot leak into "perception". Robot-tag
