@@ -9,25 +9,22 @@ Inputs (all under the challenge demos root, $B1K_RAW_DEMOS)
     normalized to the 720x720 head image. ``bbox`` (component-filtered) is used, ``raw_bbox``
     and ``filtering`` are dropped. Episodes whose report is incomplete, not ``packable`` or
     has ``length_2025 != length_2026`` are skipped (the 2025 masks would be misaligned).
-* ``behavior_ee_pose_0_99/task-XXXX/frames/chunk-*/file-*.parquet``
-    30 Hz ``observation.ee_pose.{left,right}`` = [x, y, z, qx, qy, qz, qw] in the robot frame.
-    Its ``episode_index`` is the per-task ``demo_index_within_task`` (0..199), not the dataset's
-    global episode_index (they coincide only for task 0); the namespace is detected per task.
-* ``data/chunk-*/file-*.parquet`` column ``observation.robot2cam_pose.<camera>``
-    30 Hz camera pose in the same robot frame (USD camera convention: -Z forward, +Y up).
+* ``behavior_2d_trace_00_99/task-XXXX/frames/chunk-*/file-*.parquet``
+    30 Hz end-effector position already projected into the head camera
+    (``observation.rgb.zed_link_camera_0``, 720x720, fx = fy = 306, cx = cy = 360):
+    ``observation.ee_pose_2d.{uv,visb}_{left,right}``, uv normalized with origin top-left and
+    quantized to 1/1024 (the <loc> grid Trace2DCoTBuilder emits), ``uv`` null when not
+    ``visb``. Visibility is in-frustum only, no occlusion test. Its ``episode_index`` is the
+    per-task ``demo_index_within_task`` (0..199), not the dataset's global episode_index (they
+    coincide only for task 0); the namespace is detected per task. The export's own
+    ``2d_trace_index`` points into a string table that is not shipped and is ignored.
 * ``annotations/task-XXXX/episode_<raw_id>.json`` ``skill_annotation``
     Subtask text per skill segment, rendered with the same templates the belief-graph
     pipeline uses (bgdata.operators.TEXT via bgdata.cot_targets.subtask_text), so the text is
     identical with or without belief-graph labels. Frames after the last segment: "done".
 
-The 2D trace is the EE position projected into the head camera of the same frame::
-
-    p_cam = R_cv^T (p_ee - t_cam),  R_cv = R_cam @ diag(1, -1, -1)     (USD -> OpenCV)
-    u = (fx * x / z + cx) / W,      fx = W * focal_length / horizontal_aperture
-
-with the evaluator's head camera (720 px, horizontal_aperture 40, OmniGibson's default focal
-length 17 -> fx = 306). A hand is ``visb`` when z > --min-depth and (u, v) is inside the
-image; occlusion is NOT tested (the depth videos are not decoded here).
+Frames where neither hand is visible get no trace label (Trace2DCoTBuilder.can_handle would
+reject them anyway).
 
 Output (per episode, keyed by raw_episode_id like the replay extractor)
 -----------------------------------------------------------------------
@@ -57,10 +54,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-from scipy.spatial.transform import Rotation
 
 BBOX_DIR = "behavior_bbox_2025_025fps_v2"
-EE_DIR = "behavior_ee_pose_0_99"
+TRACE_DIR = "behavior_2d_trace_00_99"
 ARMS = ("left", "right")
 
 
@@ -197,20 +193,44 @@ def read_bbox(bbox_root: Path, task: int, raw_id: int, length: int, key: str) ->
     return out, None
 
 
-class EEPoseTable:
-    """Lazily loaded per-task EE poses: episode_index -> (frame_index, left(N,7), right(N,7))."""
+class TraceTable:
+    """Lazily loaded per-task 2D traces: key -> (frame_index, {arm: uv (N,2)}, {arm: visb (N,)})."""
 
-    def __init__(self, ee_root: Path):
-        self.ee_root = ee_root
-        self.cache: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+    def __init__(self, trace_root: Path):
+        self.root = trace_root
+        self.cache: Dict[int, dict] = {}
+
+    def _files(self, task: int) -> List[Path]:
+        return sorted((self.root / f"task-{task:04d}" / "frames").glob("chunk-*/*.parquet"))
 
     def available(self, task: int) -> bool:
-        return any((self.ee_root / f"task-{task:04d}" / "frames").glob("chunk-*/*.parquet"))
+        return bool(self._files(task))
+
+    def _load(self, task: int) -> dict:
+        if task not in self.cache:
+            cols = ["episode_index", "frame_index"] + [
+                f"observation.ee_pose_2d.{k}_{arm}" for arm in ARMS for k in ("uv", "visb")
+            ]
+            df = pd.concat([pq.read_table(f, columns=cols).to_pandas() for f in self._files(task)],
+                           ignore_index=True)
+            per_ep = {}
+            for ep, g in df.groupby("episode_index", sort=False):
+                g = g.sort_values("frame_index")
+                uv, vis = {}, {}
+                for arm in ARMS:
+                    vis[arm] = g[f"observation.ee_pose_2d.visb_{arm}"].to_numpy(dtype=bool)
+                    uv[arm] = np.array(
+                        [x if v else (np.nan, np.nan)
+                         for x, v in zip(g[f"observation.ee_pose_2d.uv_{arm}"], vis[arm])],
+                        dtype=np.float64,
+                    ).reshape(-1, 2)
+                per_ep[int(ep)] = (g["frame_index"].to_numpy(), uv, vis)
+            self.cache = {task: per_ep}  # one task at a time keeps memory bounded
+        return self.cache[task]
 
     def resolve_keys(self, task: int, task_eps: pd.DataFrame) -> Dict[int, int]:
-        """global episode_index -> the key this task's EE-pose files use for it."""
-        self.get(task, -1)
-        have = set(self.cache[task])
+        """global episode_index -> the key this task's trace files use for it."""
+        have = set(self._load(task))
         global_ids = [int(e) for e in task_eps["episode_index"]]
         local_ids = [int(e) for e in task_eps["demo_index_within_task"]]
         if have <= set(global_ids) and have & set(global_ids):
@@ -218,61 +238,12 @@ class EEPoseTable:
         if have <= set(local_ids):
             return dict(zip(global_ids, local_ids))
         raise ValueError(
-            f"task {task}: EE-pose episode_index values {sorted(have)[:5]}... match neither the "
+            f"task {task}: 2D-trace episode_index values {sorted(have)[:5]}... match neither the "
             f"global episode_index nor demo_index_within_task of this task"
         )
 
-    def get(self, task: int, episode: int):
-        if task not in self.cache:
-            files = sorted((self.ee_root / f"task-{task:04d}" / "frames").glob("chunk-*/*.parquet"))
-            cols = ["episode_index", "frame_index", "observation.ee_pose.left", "observation.ee_pose.right"]
-            df = pd.concat([pq.read_table(f, columns=cols).to_pandas() for f in files], ignore_index=True)
-            per_ep = {}
-            for ep, g in df.groupby("episode_index", sort=False):
-                g = g.sort_values("frame_index")
-                per_ep[int(ep)] = (
-                    g["frame_index"].to_numpy(),
-                    np.stack(g["observation.ee_pose.left"].to_numpy()).astype(np.float64),
-                    np.stack(g["observation.ee_pose.right"].to_numpy()).astype(np.float64),
-                )
-            self.cache = {task: per_ep}  # one task at a time keeps memory bounded
-        return self.cache[task].get(episode)
-
-
-def read_cam_poses(root: Path, eps: pd.DataFrame, camera: str) -> Dict[int, np.ndarray]:
-    """episode_index -> (N, 7) robot->camera pose, frame-ordered."""
-    col = f"observation.robot2cam_pose.{camera}"
-    out: Dict[int, np.ndarray] = {}
-    for (chunk, fidx), group in eps.groupby(["data/chunk_index", "data/file_index"]):
-        path = root / "data" / f"chunk-{int(chunk):03d}" / f"file-{int(fidx):03d}.parquet"
-        wanted = [int(e) for e in group["episode_index"]]
-        t = pq.read_table(path, columns=["episode_index", "frame_index", col], filters=[("episode_index", "in", wanted)])
-        df = t.to_pandas()
-        for ep, g in df.groupby("episode_index", sort=False):
-            g = g.sort_values("frame_index")
-            if not np.array_equal(g["frame_index"].to_numpy(), np.arange(len(g))):
-                raise ValueError(f"episode {ep}: frame_index in {path.name} is not 0..N-1")
-            out[int(ep)] = np.stack(g[col].to_numpy()).astype(np.float64)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Projection
-# ---------------------------------------------------------------------------
-
-
-def project(ee: np.ndarray, cam: np.ndarray, fx: float, size: int, min_depth: float):
-    """(N,7) EE poses + (N,7) camera poses -> (N,2) normalized uv, (N,) visible."""
-    r_cv = Rotation.from_quat(cam[:, 3:7]).as_matrix() @ np.diag([1.0, -1.0, -1.0])
-    rel = ee[:, :3] - cam[:, :3]
-    p_cam = np.einsum("nij,ni->nj", r_cv, rel)  # R_cv^T @ rel
-    z = p_cam[:, 2]
-    safe_z = np.where(np.abs(z) < 1e-6, 1e-6, z)
-    c = size / 2.0
-    u = (fx * p_cam[:, 0] / safe_z + c) / size
-    v = (fx * p_cam[:, 1] / safe_z + c) / size
-    visible = (z > min_depth) & (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1)
-    return np.stack([u, v], axis=1), visible
+    def get(self, task: int, key: int):
+        return self._load(task).get(key)
 
 
 def trace_payload(uv: Dict[str, np.ndarray], vis: Dict[str, np.ndarray], k: int) -> Optional[dict]:
@@ -280,8 +251,9 @@ def trace_payload(uv: Dict[str, np.ndarray], vis: Dict[str, np.ndarray], k: int)
         return None  # Trace2DCoTBuilder.can_handle rejects frames with no visible hand anyway
     out = {}
     for arm in ARMS:
-        ok = bool(vis[arm][k])
-        out[f"uv_{arm}"] = [round(float(uv[arm][k, 0]), 4), round(float(uv[arm][k, 1]), 4)] if ok else None
+        ok = bool(vis[arm][k]) and not np.isnan(uv[arm][k]).any()
+        # values are k/1024 already; 6 decimals keeps them exact on the <loc> grid
+        out[f"uv_{arm}"] = [round(float(uv[arm][k, 0]), 6), round(float(uv[arm][k, 1]), 6)] if ok else None
         out[f"visb_{arm}"] = ok
     return out
 
@@ -320,25 +292,18 @@ def main() -> int:
     ap.add_argument("--tasks", type=int, nargs="+", required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--bbox-dir", type=Path, help=f"default <demos-root>/{BBOX_DIR}")
-    ap.add_argument("--ee-pose-dir", type=Path, help=f"default <demos-root>/{EE_DIR}")
+    ap.add_argument("--trace-dir", type=Path, help=f"default <demos-root>/{TRACE_DIR}")
     ap.add_argument("--no-subtask", action="store_true")
     ap.add_argument("--no-bbox", action="store_true")
     ap.add_argument("--no-trace", action="store_true")
     ap.add_argument("--bbox-key", default="bbox", choices=["bbox", "raw_bbox"])
-    ap.add_argument("--camera", default="zed_link_camera_0")
-    ap.add_argument("--image-size", type=int, default=720)
-    ap.add_argument("--focal-length", type=float, default=17.0)
-    ap.add_argument("--horizontal-aperture", type=float, default=40.0)
-    ap.add_argument("--min-depth", type=float, default=0.05, help="metres in front of the camera")
     ap.add_argument("--max-episodes", type=int, default=None, help="per task, for smoke tests")
     args = ap.parse_args()
 
     root = args.demos_root
     bbox_root = args.bbox_dir or root / BBOX_DIR
-    ee = EEPoseTable(args.ee_pose_dir or root / EE_DIR)
-    fx = args.image_size * args.focal_length / args.horizontal_aperture
+    traces = TraceTable(args.trace_dir or root / TRACE_DIR)
     args.out.mkdir(parents=True, exist_ok=True)
-    log(f"head camera {args.camera}: {args.image_size}px, fx = {fx:.2f}")
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))  # bgdata
     eps = read_episodes(root, args.tasks)
@@ -348,11 +313,10 @@ def main() -> int:
         task = int(task)
         if args.max_episodes:
             task_eps = task_eps.head(args.max_episodes)
-        do_trace = not args.no_trace and ee.available(task)
+        do_trace = not args.no_trace and traces.available(task)
         if not args.no_trace and not do_trace:
-            log(f"task {task}: no EE poses under {ee.ee_root}/task-{task:04d} -> bbox only")
-        cams = read_cam_poses(root, task_eps, args.camera) if do_trace else {}
-        ee_key = ee.resolve_keys(task, task_eps) if do_trace else {}
+            log(f"task {task}: no 2D traces under {traces.root}/task-{task:04d} -> no trace labels")
+        trace_key = traces.resolve_keys(task, task_eps) if do_trace else {}
 
         stats = defaultdict(int)
         skips: Dict[str, List[int]] = defaultdict(list)
@@ -377,16 +341,13 @@ def main() -> int:
                 stats["bbox_frames"] += len(boxes)
 
             if do_trace:
-                pose = ee.get(task, ee_key[ep])
-                cam = cams.get(ep)
-                if pose is None or cam is None:
+                trace = traces.get(task, trace_key[ep])
+                if trace is None:
                     skips["trace:missing"].append(raw_id)
-                elif len(pose[0]) != length or len(cam) != length or not np.array_equal(pose[0], np.arange(length)):
+                elif not np.array_equal(trace[0], np.arange(length)):
                     skips["trace:length_mismatch"].append(raw_id)
                 else:
-                    uv, vis = {}, {}
-                    for arm, arr in zip(ARMS, pose[1:]):
-                        uv[arm], vis[arm] = project(arr, cam, fx, args.image_size, args.min_depth)
+                    _, uv, vis = trace
                     for k in range(length):
                         payload = trace_payload(uv, vis, k)
                         if payload is not None:
