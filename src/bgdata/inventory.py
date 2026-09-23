@@ -71,20 +71,27 @@ def load_annotation(path: str) -> dict:
 
 
 def segments(ann: dict) -> list[dict]:
-    """Flatten skill_annotation into one record per segment."""
+    """Flatten skill_annotation into one record per segment.
+
+    frame_duration is normally [start, end]; a skill that was interrupted and resumed is stored
+    as [[s1, s2, ...], [e1, e2, ...]] -> one record per interval (same skill_idx, part=i)."""
     out = []
     for sk in ann["skill_annotation"]:
-        out.append(
-            dict(
-                skill_idx=sk["skill_idx"],
-                skill_id=sk["skill_id"][0],
-                skill=sk["skill_description"][0],
-                objects=list(sk["object_id"][0]) if sk["object_id"] else [],
-                manip=(sk["manipulating_object_id"] or [None])[0],
-                memory_prefix=(sk["memory_prefix"] or [""])[0],
-                start=sk["frame_duration"][0],
-                end=sk["frame_duration"][1],
-                skill_type=(sk["skill_type"] or [""])[0],
+        st, en = sk["frame_duration"][0], sk["frame_duration"][1]
+        parts = list(zip(st, en)) if isinstance(st, (list, tuple)) else [(st, en)]
+        for i, (a, b) in enumerate(parts):
+            out.append(
+                dict(
+                    skill_idx=sk["skill_idx"],
+                    part=i,
+                    skill_id=sk["skill_id"][0],
+                    skill=sk["skill_description"][0],
+                    objects=list(sk["object_id"][0]) if sk["object_id"] else [],
+                    manip=(sk["manipulating_object_id"] or [None])[0],
+                    memory_prefix=(sk["memory_prefix"] or [""])[0],
+                    start=int(a),
+                    end=int(b),
+                    skill_type=(sk["skill_type"] or [""])[0],
+                )
             )
-        )
     return out

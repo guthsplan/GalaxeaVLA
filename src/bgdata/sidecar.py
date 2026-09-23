@@ -20,8 +20,9 @@ def strip_count(line: str) -> str:
     return re.sub(r" \d+/(\d+) ", r" 0/\1 ", line)
 
 
-def build_vocab(records_by_ep: dict[int, list[dict]], goal_lines: list[str]) -> list[str]:
-    keys = set()
+def build_vocab(records_by_ep: dict[int, list[dict]], goal_lines: list[str],
+                extra_keys=()) -> list[str]:
+    keys = set(extra_keys)
     for recs in records_by_ep.values():
         for r in recs:
             keys |= set(r["predicates"])
@@ -38,10 +39,12 @@ def build_sidecar(records_by_ep: dict[int, list[dict]], vocab: list[str], K: int
             vals = np.full(K, -1.0, dtype=np.float32)
             obs = np.zeros(K, dtype=np.int64)
             for j, (k, (val, p, o, src)) in enumerate(sorted(r["predicates"].items())[:K]):
+                if k not in vid:
+                    continue
                 ids[j], vals[j], obs[j] = vid[k], p, int(o)
             rem = np.full(R, -1, dtype=np.int64)
             for j, line in enumerate(r["remaining_goal_lines"][:R]):
-                rem[j] = vid[strip_count(line)]
+                rem[j] = vid.get(strip_count(line), -1)
             rows.append({"task": task, "episode": ep, "frame": r["step"],
                          "bg.pred_ids": ids, "bg.pred_vals": vals,
                          "bg.pred_obs": obs, "bg.rem_ids": rem})

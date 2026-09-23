@@ -1,9 +1,13 @@
-"""Operator library extraction from skill-annotation segments + predicate labels.
+"""Operator library extraction from skill-annotation segments + predicate labels (all skills).
 
 pre : predicate (or its negation) true at segment start in >= PRE_SUPPORT of segments
 eff : predicate value change start->end consistent in >= EFF_SUPPORT of segments
 Arguments are abstracted by their position in object_id; inside/ontop are merged into
 the abstract relation in_or_on, and the concrete relation goes to the per-operator `rel`.
+
+The skill vocabulary of the 100-task annotations (skill_summary.csv) is covered by SKILL_TABLE;
+any skill not listed falls back to a generic operator named after the skill with positional
+arguments ?o ?r ?t, so no task can silently drop its segments.
 """
 import json
 import re
@@ -16,25 +20,62 @@ PRE_SUPPORT = 0.95
 EFF_SUPPORT = 0.85
 SETTLE = 6  # frames (30 fps) after segment end before sampling the post state
 
-SKILL_TO_OP = {
-    "move to": ("move_to", ["?o"]),
-    "open door": ("open_door", ["?d"]),
-    "close door": ("close_door", ["?d"]),
-    "pick up from": ("pick_up_from", ["?o", "?r"]),
-    "place on": ("place_on", ["?o", "?r"]),
-    "place in": ("place_in", ["?o", "?r"]),
-    "turn on switch": ("turn_on_switch", ["?d"]),
+# skill text -> (operator name, argument names, Subtask text template)
+# {mp} = memory prefix ("the other ", "back "), filled by cot_targets.subtask_text
+SKILL_TABLE = {
+    "move to":            ("move_to",            ["?o"],             "move {mp}to {?o}"),
+    "pick up from":       ("pick_up_from",       ["?o", "?r"],       "pick up {mp}{?o} from {?r}"),
+    "place on":           ("place_on",           ["?o", "?r"],       "place {?o} on {?r}"),
+    "place in":           ("place_in",           ["?o", "?r"],       "place {?o} in {?r}"),
+    "place on next to":   ("place_on_next_to",   ["?o", "?r", "?t"], "place {?o} on {?r} next to {?t}"),
+    "place in next to":   ("place_in_next_to",   ["?o", "?r", "?t"], "place {?o} in {?r} next to {?t}"),
+    "place under":        ("place_under",        ["?o", "?r"],       "place {?o} under {?r}"),
+    "push to":            ("push_to",            ["?o", "?r"],       "push {?o} to {?r}"),
+    "open door":          ("open_door",          ["?d"],             "open door {?d}"),
+    "close door":         ("close_door",         ["?d"],             "close door {?d}"),
+    "open drawer":        ("open_drawer",        ["?d"],             "open drawer {?d}"),
+    "close drawer":       ("close_drawer",       ["?d"],             "close drawer {?d}"),
+    "open lid":           ("open_lid",           ["?d"],             "open lid {?d}"),
+    "close lid":          ("close_lid",          ["?d"],             "close lid {?d}"),
+    "turn on switch":     ("turn_on_switch",     ["?d"],             "turn on switch {?d}"),
+    "turn off switch":    ("turn_off_switch",    ["?d"],             "turn off switch {?d}"),
+    "press":              ("press",              ["?d"],             "press {?d}"),
+    "chop":               ("chop",               ["?o", "?r"],       "chop {?r} with {?o}"),
+    "pour":               ("pour",               ["?o", "?s", "?r"], "pour {?o} from {?s} into {?r}"),
+    "sweep surface":      ("sweep_surface",      ["?o", "?r"],       "sweep {?r} with {?o}"),
+    "sweep off":          ("sweep_off",          ["?o", "?r"],       "sweep {?o} off {?r}"),
+    "wipe hard":          ("wipe_hard",          ["?o", "?r"],       "wipe {?r} with {?o}"),
+    "spray":              ("spray",              ["?o", "?r"],       "spray {?r} with {?o}"),
+    "hand over":          ("hand_over",          ["?o"],             "hand over {?o}"),
+    "turn to":            ("turn_to",            ["?o", "?r"],       "turn {?o} to {?r}"),
+    "insert":             ("insert",             ["?o", "?r"],       "insert {?o} into {?r}"),
+    "attach":             ("attach",             ["?o", "?r"],       "attach {?o} to {?r}"),
+    "hang":               ("hang",               ["?o", "?r"],       "hang {?o} on {?r}"),
+    "ignite":             ("ignite",             ["?o", "?r"],       "ignite {?r} with {?o}"),
+    "tip over":           ("tip_over",           ["?o"],             "tip over {?o}"),
+    "hold":               ("hold",               ["?o"],             "hold {?o}"),
+    "release":            ("release",            ["?o"],             "release {?o}"),
+    "lift":               ("lift",               ["?o"],             "lift {?o}"),
+    "pull tray":          ("pull_tray",          ["?d"],             "pull tray {?d}"),
+    "push tray":          ("push_tray",          ["?d"],             "push tray {?d}"),
 }
-OP_ARGS = {v[0]: v[1] for v in SKILL_TO_OP.values()}
-TEXT = {
-    "move_to": "move {mp}to {?o}",
-    "open_door": "open door {?d}",
-    "close_door": "close door {?d}",
-    "pick_up_from": "pick up {mp}{?o} from {?r}",
-    "place_on": "place {?o} on {?r}",
-    "place_in": "place {?o} in {?r}",
-    "turn_on_switch": "turn on switch {?d}",
-}
+_GENERIC_ARGS = ["?o", "?r", "?t", "?u"]
+
+
+def op_for(skill: str, n_objects: int | None = None) -> tuple[str, list[str], str]:
+    """(op_name, arg_names, text_template) for a skill; generic fallback for unknown skills."""
+    if skill in SKILL_TABLE:
+        return SKILL_TABLE[skill]
+    n = max(1, min(n_objects or 1, len(_GENERIC_ARGS)))
+    args = _GENERIC_ARGS[:n]
+    text = skill + "".join(" {" + a + "}" for a in args)
+    return skill.replace(" ", "_"), args, text
+
+
+# backwards-compatible views used by cot_targets / belief_trace / validation
+SKILL_TO_OP = {k: (v[0], v[1]) for k, v in SKILL_TABLE.items()}
+OP_ARGS = {v[0]: v[1] for v in SKILL_TABLE.values()}
+TEXT = {v[0]: v[2] for v in SKILL_TABLE.values()}
 
 PRED_RE = re.compile(r"^\((\S+)((?:\s+\S+)*)\)$")
 
@@ -46,16 +87,26 @@ def parse_key(key: str):
     return name, args
 
 
+def seg_op(seg: dict):
+    """(op_name, arg_names, objs) for a resolved segment, or None when no object is known."""
+    objs = [o for o in seg.get("objects", []) if o]
+    op, args, _ = op_for(seg["skill"], len(objs))
+    objs = objs[: len(args)]
+    if len(objs) < len(args):
+        return None
+    return op, args, objs
+
+
 def snapshot(df_ep: pd.DataFrame, frame: int) -> dict[str, bool]:
     frames = df_ep["frame"].values
     tgt = frames[np.argmin(np.abs(frames - frame))]
     sub = df_ep[df_ep.frame == tgt]
     snap = dict(zip(sub.key, sub.value))
-    snap["(handempty)"] = not any(v for k, v in snap.items() if k.startswith("(inhand ") )
+    snap["(handempty)"] = not any(v for k, v in snap.items() if k.startswith("(inhand "))
     return snap
 
 
-def abstract_snapshot(snap: dict[str, bool], mapping: dict[str, str]) -> dict[str, bool]:
+def abstract_snapshot(snap: dict[str, bool], mapping: dict[str, str]):
     """Keep only predicates whose args are all in `mapping`; merge inside/ontop -> in_or_on."""
     out = {}
     inon = defaultdict(bool)
@@ -85,24 +136,23 @@ def abstract_snapshot(snap: dict[str, bool], mapping: dict[str, str]) -> dict[st
 def extract_operators(label_dfs: dict[int, pd.DataFrame], segs_by_ep: dict[int, list[dict]],
                       n_frames_by_ep: dict[int, int]):
     """Returns (operators dict in scaffold schema, stats DataFrame)."""
-    per_op = defaultdict(list)  # op -> list of (pre_snap, post_snap, concrete_rel, skill_id, skill_type)
+    per_op = defaultdict(list)
     for ep, segs in segs_by_ep.items():
         df_ep = label_dfs[ep]
         N = n_frames_by_ep[ep]
         for s in segs:
-            if s["skill"] not in SKILL_TO_OP:
+            so = seg_op(s)
+            if so is None:
                 continue
-            op, argnames = SKILL_TO_OP[s["skill"]]
-            objs = s["objects"][: len(argnames)]
-            if len(objs) < len(argnames):
-                continue
+            op, argnames, objs = so
             mapping = dict(zip(objs, argnames))
             pre_raw = snapshot(df_ep, s["start"])
             post_raw = snapshot(df_ep, min(s["end"] + SETTLE, N - 1))
             pre, _ = abstract_snapshot(pre_raw, mapping)
             post, post_rel = abstract_snapshot(post_raw, mapping)
-            per_op[op].append(dict(pre=pre, post=post, post_rel=post_rel,
-                                   skill_id=s["skill_id"], skill_type=s["skill_type"]))
+            per_op[op].append(dict(pre=pre, post=post, post_rel=post_rel, args=argnames,
+                                   skill_id=s["skill_id"], skill_type=s["skill_type"],
+                                   text=op_for(s["skill"], len(objs))[2]))
 
     ops_json, stats_rows = {}, []
     for op, recs in per_op.items():
@@ -122,7 +172,6 @@ def extract_operators(label_dfs: dict[int, pd.DataFrame], segs_by_ep: dict[int, 
                                    support_pre_true=round(float(true_at_start), 3),
                                    support_eff_pos=round(float(pos_change), 3),
                                    support_eff_neg=round(float(neg_change), 3)))
-        # effects: consistent value changes ((handempty) is derived from inhand — pre only)
         for k, (t0, pos, neg) in support.items():
             if k == "(handempty)":
                 continue
@@ -130,14 +179,11 @@ def extract_operators(label_dfs: dict[int, pd.DataFrame], segs_by_ep: dict[int, 
                 eff_list.append(k)
             elif neg >= EFF_SUPPORT:
                 eff_list.append(f"(not {k})")
-        # preconditions: positive if reliably true at start; negative only for the
-        # delete/add-duals of this op's own positive effects (avoids vacuous negatives)
         for k, (t0, pos, neg) in support.items():
             if t0 >= PRE_SUPPORT:
                 pre_list.append(k)
             elif t0 <= 1 - PRE_SUPPORT and k in eff_list:
                 pre_list.append(f"(not {k})")
-        # rel: majority concrete relation among positive in_or_on effects
         rels = [nm for r in recs for nm in r["post_rel"].values()]
         rel = ""
         if any(e.startswith("(in_or_on") for e in eff_list) and rels:
@@ -147,9 +193,9 @@ def extract_operators(label_dfs: dict[int, pd.DataFrame], segs_by_ep: dict[int, 
             disturbs = ["(in_or_on ?y ?r)"]
         sid = recs[0]["skill_id"]
         stype = recs[0]["skill_type"] or "uncoordinated"
-        args = OP_ARGS[op]
-        ops_json[op] = dict(skill_id=int(sid), args=args, pre=pre_list, eff=eff_list,
-                            text=TEXT[op], skill_type=stype, disturbs=disturbs, rel=rel)
+        ops_json[op] = dict(skill_id=int(sid), args=recs[0]["args"], pre=pre_list, eff=eff_list,
+                            text=recs[0]["text"], skill_type=stype, disturbs=disturbs, rel=rel,
+                            n_segments=n)
     return ops_json, pd.DataFrame(stats_rows)
 
 
@@ -181,7 +227,7 @@ def concretize_pre(op: dict, objs: list[str]) -> list[tuple[str, bool]]:
         inner = e[5:-1] if neg else e
         name, args = parse_key(inner)
         if name in ("handempty", "in_or_on"):
-            continue  # ambiguous grounding; skip for assertion
+            continue
         gargs = [mapping.get(a, a) for a in args]
         out.append((f"({name}{''.join(' ' + a for a in gargs)})", not neg))
     return out
@@ -197,11 +243,7 @@ def _derive_visited(pred: dict):
 
 def validate_accumulation(ops_json: dict, label_dfs: dict[int, pd.DataFrame],
                           segs_by_ep: dict[int, list[dict]]) -> pd.DataFrame:
-    """Accumulate operator pre+eff in annotation order; mismatch vs labels.
-
-    Reports two rates per key: per-frame (all 10 Hz frames) and boundary (only at
-    segment-start frames, i.e. steady states between skills).
-    """
+    """Accumulate operator pre+eff in annotation order; mismatch vs labels (per-frame + boundary)."""
     rows = []
     for ep, segs in segs_by_ep.items():
         df_ep = label_dfs[ep]
@@ -209,8 +251,8 @@ def validate_accumulation(ops_json: dict, label_dfs: dict[int, pd.DataFrame],
         keys = sorted(k for k in df_ep.key.unique()
                       if parse_key(k)[0] not in ("inhand_left", "inhand_right"))
         gt = df_ep.pivot_table(index="frame", columns="key", values="value", aggfunc="first")
-        pred = dict(gt.loc[frames[0]][keys])  # start from initial labels
-        seg_iter = sorted([s for s in segs if s["skill"] in SKILL_TO_OP], key=lambda s: s["end"])
+        pred = dict(gt.loc[frames[0]][keys])
+        seg_iter = sorted([s for s in segs if seg_op(s) is not None], key=lambda s: s["end"])
         boundary_frames = {frames[np.argmin(np.abs(frames - s["start"]))] for s in seg_iter}
         si = 0
         mism = {k: 0 for k in keys}
@@ -218,15 +260,13 @@ def validate_accumulation(ops_json: dict, label_dfs: dict[int, pd.DataFrame],
         for fr in frames:
             while si < len(seg_iter) and seg_iter[si]["end"] <= fr:
                 s = seg_iter[si]
-                op = ops_json.get(SKILL_TO_OP[s["skill"]][0])
+                op_name, _, objs = seg_op(s)
+                op = ops_json.get(op_name)
                 if op:
-                    objs = s["objects"][: len(op["args"])]
-                    # assert preconditions (they held while the skill executed)
                     for gk, gv in concretize_pre(op, objs):
                         if gk in pred:
                             pred[gk] = gv
                     effs = concretize_effects(op, objs)
-                    # mobile-base exclusivity: reaching a new target leaves the previous one
                     if any(gk.startswith("(reachable ") and gv for gk, gv in effs):
                         for k in pred:
                             if k.startswith("(reachable "):
@@ -256,7 +296,7 @@ def validate_memory_prefix(label_dfs, segs_by_ep) -> pd.DataFrame:
         df_ep = label_dfs[ep]
         for s in segs:
             mp = s["memory_prefix"]
-            if not mp:
+            if not mp or not s.get("objects"):
                 continue
             snap = snapshot(df_ep, s["start"])
             if mp == "the other":
@@ -265,6 +305,7 @@ def validate_memory_prefix(label_dfs, segs_by_ep) -> pd.DataFrame:
                 same_cat = sorted({parse_key(k)[1][0] for k in snap
                                    if parse_key(k)[0] in ("inside", "ontop")
                                    and parse_key(k)[1][0].rsplit("_", 1)[0] == cat})
+
                 def at_src(o):
                     return (snap.get(f"(inside {o} {src})", False)
                             or snap.get(f"(ontop {o} {src})", False))

@@ -12,7 +12,10 @@ import json
 
 from .config import (DISTURB_FACTOR, DISTURB_FLOOR, OBS_CONF_TRUE, PRIOR_CONF,
                      PROVISIONAL_CONF)
-from .operators import SKILL_TO_OP, concretize_effects, parse_key
+from .goal import TaskGoal
+from .operators import concretize_effects, parse_key, seg_op
+
+APPEAR = {"cooked", "toggled_on", "open", "frozen", "on_fire", "covered", "filled", "contains", "real"}
 
 
 def p_true(entry):
@@ -20,17 +23,18 @@ def p_true(entry):
 
 
 class BeliefSim:
-    def __init__(self, ops_json: dict, init_lines: list[tuple[str, bool]],
-                 goal_specs: list[dict], key_universe: set[str] | None = None):
-        """goal_specs: [{line, pred, instances}] — count goals over exchangeable instances.
-        key_universe: known predicate keys; operator effects grounding outside it are skipped
-        (guards against annotation errors such as open door ['hotdog_208'] in ep 450280)."""
+    def __init__(self, ops_json: dict, init_lines, goal: TaskGoal,
+                 key_universe: set[str] | None = None):
+        """key_universe: known predicate keys; operator effects grounding outside it are skipped
+        (guards against annotation errors such as open door ['hotdog_208'])."""
         self.ops = ops_json
         self.table = {}
-        self.goals = goal_specs
+        self.goal = goal
         self.universe = key_universe
         self.change_log = []
         for key, val in init_lines:
+            if key_universe is not None and key not in key_universe:
+                continue
             self.table[key] = dict(value=val, conf=PRIOR_CONF, source="prior", observed=False)
 
     def _log(self, step, key, old_p, rule):
@@ -47,19 +51,22 @@ class BeliefSim:
                     e["observed"] = False
                 continue
             old = p_true(e) if e else None
-            tag = "appear" if parse_key(key)[0] in ("cooked", "toggled_on", "open") else "geom"
+            tag = "appear" if parse_key(key)[0] in APPEAR else "geom"
             self.table[key] = dict(value=bool(val), conf=OBS_CONF_TRUE, source=tag, observed=True)
             self._log(step, key, old, "prior->observed" if (e and e["source"] == "prior") else "observed")
             observed.add(key)
         return observed
 
-    def apply_operator(self, step, skill: str, objs: list[str], observed: set):
-        op = self.ops.get(SKILL_TO_OP.get(skill, (None,))[0])
+    def apply_operator(self, step, seg: dict, observed: set):
+        so = seg_op(seg)
+        if so is None:
+            return
+        op_name, _, objs = so
+        op = self.ops.get(op_name)
         if not op:
             return
         touched = set()
         effs = concretize_effects(op, objs)
-        # mobile-base exclusivity: a positive (reachable X) effect implies leaving everywhere else
         if any(gk.startswith("(reachable ") and gv for gk, gv in effs):
             for key in list(self.table):
                 if key.startswith("(reachable ") and key not in observed \
@@ -72,15 +79,14 @@ class BeliefSim:
                         self._log(step, key, old, "provisional effect 0.7 (exclusive reachable)")
         for gk, gv in effs:
             if self.universe is not None and gk not in self.universe:
-                continue  # mis-grounded effect (annotation error); skip
+                continue
             touched.add(gk)
             if gk in observed:
-                continue  # the observation this step wins
+                continue
             e = self.table.get(gk)
             old = p_true(e) if e else None
             self.table[gk] = dict(value=gv, conf=PROVISIONAL_CONF, source="effect", observed=False)
             self._log(step, gk, old, "provisional effect 0.7")
-        # disturbance: same-container relations (?y ?r) not touched this step
         mapping = dict(zip(op["args"], objs))
         r = mapping.get("?r")
         if r and op.get("disturbs"):
@@ -92,18 +98,12 @@ class BeliefSim:
                     e["conf"] = max(DISTURB_FLOOR, e["conf"] * DISTURB_FACTOR)
                     self._log(step, key, old, "disturbance x0.8")
 
+    def lookup(self, key):
+        e = self.table.get(key)
+        return None if e is None else bool(e["value"])
+
     def remaining_goals(self):
-        rem = []
-        total_sat = total_n = 0
-        for g in self.goals:
-            sat = sum(1 for inst in g["instances"]
-                      if self.table.get(f"({g['pred']} {inst})", {}).get("value", False))
-            n = len(g["instances"])
-            total_sat += sat
-            total_n += n
-            if sat < n:
-                rem.append(g["line"].replace(" 0/", f" {sat}/"))
-        return rem, (total_sat / total_n if total_n else 1.0)
+        return self.goal.remaining(self.lookup)
 
     def snapshot(self):
         return {k: [e["value"], round(p_true(e), 4), e["observed"], e["source"]]
@@ -111,20 +111,18 @@ class BeliefSim:
 
 
 def run_trace(truth: dict[int, dict], segments: list[dict], ops_json: dict,
-              init_lines, goal_specs, out_jsonl: str):
+              init_lines, goal: TaskGoal, out_jsonl: str):
     frames = sorted(truth)
     universe = set(truth[frames[0]])
-    sim = BeliefSim(ops_json, init_lines, goal_specs, key_universe=universe)
-    seg_ends = sorted([s for s in segments if s["skill"] in SKILL_TO_OP], key=lambda s: s["end"])
+    sim = BeliefSim(ops_json, init_lines, goal, key_universe=universe)
+    seg_ends = sorted([s for s in segments if seg_op(s) is not None], key=lambda s: s["end"])
     si = 0
     records = []
     with open(out_jsonl, "w") as f:
         for fr in frames:
             observed = sim.observe(fr, truth[fr])
             while si < len(seg_ends) and seg_ends[si]["end"] <= fr:
-                s = seg_ends[si]
-                op_args = s["objects"][: len(SKILL_TO_OP[s["skill"]][1])]
-                sim.apply_operator(fr, s["skill"], op_args, observed)
+                sim.apply_operator(fr, seg_ends[si], observed)
                 si += 1
             cur = next((s for s in segments if s["start"] <= fr < s["end"]), None)
             rem, prog = sim.remaining_goals()
