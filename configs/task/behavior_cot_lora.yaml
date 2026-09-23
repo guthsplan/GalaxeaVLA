@@ -1,11 +1,14 @@
 # @package _global_
-# G0.5 CoT LoRA fine-tuning on BEHAVIOR: visual CoT only (BBox + 2D trace), AR + FM.
+# G0.5 CoT LoRA fine-tuning on BEHAVIOR: behavior_cot_v2's CoT mix WITHOUT the belief-graph
+# targets, AR + FM.
 #
 # Inherits behavior_cot_v2.yaml (no BeliefGraph input slot, predict_cot, pred_eov, gripper
 # no-op dropout disabled) and changes three things:
 #
-#   1. CoT mix  -> BBoxCoTBuilder + Trace2DCoTBuilder only. The belief-graph targets are
-#                  switched on by behavior_cot_lora_bg.yaml, which inherits this file.
+#   1. CoT mix  -> the non-belief-graph builders of behavior_cot_v2 (same weights):
+#                  AtomicTaskBase, BBoxSubtask, Subtask, BBox, Trace2D. Dropped: Delta, Update,
+#                  Observe, Effect, FullBelief, ObserveUpdate, SubtaskEffect (the last one
+#                  carries an Effect: field). behavior_cot_lora_bg.yaml restores them.
 #   2. Objective-> AR CE (CoT + ActionCodec tokens) AND flow matching on the action expert.
 #                  loss = ar.ce_weight * ce_loss + fm.fm_weight * fm_loss (g05_policy.py).
 #                  At inference the executed action is the FM one (generate_action keeps
@@ -19,10 +22,10 @@
 #     TASK_CONFIG=behavior_cot_lora_bg bash scripts/train_g05_cot.sh <EXP> ...   # BG on
 #   or scripts/train_g05_cot_lora.sh --bg on|off, which picks between the two.
 #
-# Labels: bbox_index / 2d_trace_index, materialized by tools/build_b1k_bbox_trace_sidecars.py
-# + tools/merge_b1k_cot_labels.py. Frames with neither label (bbox is 0.25 Hz; trace needs a
-# hand in view) have no applicable candidate and fall back to BaseSamplesBuilder, i.e. the
-# plain no-CoT prompt -> action — which is also the format a no-CoT eval uses.
+# Labels: atomic_task_index (Subtask, from the skill annotations), bbox_index, 2d_trace_index,
+# built by scripts/build_cot_bbox_trace.sh (tools/build_b1k_bbox_trace_sidecars.py +
+# tools/merge_b1k_cot_labels.py). Subtask covers every annotated frame, so the BaseSamplesBuilder
+# (no-CoT) fallback only fires on unannotated episodes.
 defaults:
 - behavior_cot_v2
 - _self_
@@ -65,11 +68,17 @@ model:
   processor:
     samples_builder:
       candidates:
+      - _target_: g05.data_processor.processor.samples_builder.AtomicTaskBaseSamplesBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.BBoxSubtaskCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder
+        weight: 1.0
       - _target_: g05.data_processor.processor.samples_builder.BBoxCoTBuilder
         weight: 1.0
       - _target_: g05.data_processor.processor.samples_builder.Trace2DCoTBuilder
         weight: 1.0
-      # Which CoT the policy generates before acting at eval time. BBoxCoTBuilder cannot be
-      # used here: its eval_required_fields=("bbox",) is never satisfied at inference.
+      # Which CoT the policy generates before acting at eval time (as behavior_cot_v2).
+      # BBoxCoTBuilder / AtomicTaskBase cannot be: their eval_required_fields need labels.
       eval_builder:
-        _target_: g05.data_processor.processor.samples_builder.Trace2DCoTBuilder
+        _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder

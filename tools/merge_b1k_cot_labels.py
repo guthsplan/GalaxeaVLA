@@ -213,7 +213,7 @@ def _insert(rows: SourceRows, episode: int, frame: int, label: str, payload: str
     bucket[label] = payload
 
 
-def read_bg_targets(path: Path, rows: SourceRows) -> None:
+def read_bg_targets(path: Path, rows: SourceRows, skip: Tuple[str, ...] = ()) -> None:
     """Read `cot_targets.parquet` from the solution repo's `bg` branch.
 
     Expected columns: ``episode``, ``frame``, and any of ``subtask`` / ``belief``
@@ -253,8 +253,12 @@ def read_bg_targets(path: Path, rows: SourceRows) -> None:
         "bg_known": "bg_known",
     }
     label_cols = {
-        _SOURCE_TO_LABEL[src]: lower[src] for src in _SOURCE_TO_LABEL if src in lower
+        _SOURCE_TO_LABEL[src]: lower[src]
+        for src in _SOURCE_TO_LABEL
+        if src in lower and _SOURCE_TO_LABEL[src] not in skip
     }
+    if skip:
+        log(f"  {path.name}: ignoring {sorted(skip)} (supplied by another source)")
     if not label_cols:
         sys.exit(
             f"{path}: none of subtask/belief/delta/effect/observe present. "
@@ -765,6 +769,12 @@ def main() -> int:
     ap.add_argument("--dataset", required=True, type=Path, help="LeRobot v3 subset to annotate in place")
     ap.add_argument("--bg-targets", type=Path, help="cot_targets.parquet from the bg branch")
     ap.add_argument("--cot-sidecar-dir", type=Path, help="directory of episode_*_cot_*.json{,l}")
+    ap.add_argument(
+        "--subtask-targets",
+        type=Path,
+        help="parquet (episode, frame, subtask) from build_b1k_bbox_trace_sidecars.py; when given, "
+        "the subtask column of --bg-targets is ignored",
+    )
     ap.add_argument("--synthetic", action="store_true", help="generate fixture labels instead of reading sidecars")
     ap.add_argument("--episodes", type=int, default=8, help="--synthetic: episodes to label")
     ap.add_argument("--seed", type=int, default=0)
@@ -802,11 +812,13 @@ def main() -> int:
         log(f"synthetic labels: {args.episodes} episodes, target_hz={args.target_hz} -> stride {stride} frames @ {geom.fps} fps")
         rows = synthesize(geom, args.episodes, args.target_hz, args.seed)
     else:
-        if not args.bg_targets and not args.cot_sidecar_dir:
-            sys.exit("pass --bg-targets and/or --cot-sidecar-dir (or --synthetic)")
+        if not (args.bg_targets or args.cot_sidecar_dir or args.subtask_targets):
+            sys.exit("pass --bg-targets, --subtask-targets and/or --cot-sidecar-dir (or --synthetic)")
         log("reading sources")
+        if args.subtask_targets:
+            read_bg_targets(args.subtask_targets, rows)
         if args.bg_targets:
-            read_bg_targets(args.bg_targets, rows)
+            read_bg_targets(args.bg_targets, rows, skip=("subtask",) if args.subtask_targets else ())
         if args.cot_sidecar_dir:
             read_cot_sidecars(args.cot_sidecar_dir, rows)
 

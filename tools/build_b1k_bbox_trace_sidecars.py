@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert the BEHAVIOR 2026 bbox / EE-pose exports into CoT sidecars for merge_b1k_cot_labels.py.
+"""Build the non-belief-graph CoT labels (Subtask, BBox, 2D trace) for merge_b1k_cot_labels.py.
 
 Inputs (all under the challenge demos root, $B1K_RAW_DEMOS)
 ------------------------------------------------------------
@@ -14,6 +14,10 @@ Inputs (all under the challenge demos root, $B1K_RAW_DEMOS)
     keyed by the 2026 ``episode_index``.
 * ``data/chunk-*/file-*.parquet`` column ``observation.robot2cam_pose.<camera>``
     30 Hz camera pose in the same robot frame (USD camera convention: -Z forward, +Y up).
+* ``annotations/task-XXXX/episode_<raw_id>.json`` ``skill_annotation``
+    Subtask text per skill segment, rendered with the same templates the belief-graph
+    pipeline uses (bgdata.operators.TEXT via bgdata.cot_targets.subtask_text), so the text is
+    identical with or without belief-graph labels. Frames after the last segment: "done".
 
 The 2D trace is the EE position projected into the head camera of the same frame::
 
@@ -28,11 +32,12 @@ Output (per episode, keyed by raw_episode_id like the replay extractor)
 -----------------------------------------------------------------------
     <out>/episode_<raw_id>_cot_strings.json   de-duplicated payload strings
     <out>/episode_<raw_id>_cot_index.jsonl    {"frame_index", "bbox_index", "2d_trace_index"}
+    <out>/subtask_targets.parquet             (episode=raw_id, frame, subtask) at segment starts
     <out>/coverage.json                       per-task / per-episode counts and skip reasons
 
 then:
     python tools/merge_b1k_cot_labels.py --dataset <subset> --cot-sidecar-dir <out> \\
-        --sidecar-episode-key raw
+        --subtask-targets <out>/subtask_targets.parquet --sidecar-episode-key raw
 
 Usage
 -----
@@ -72,6 +77,30 @@ def read_episodes(root: Path, tasks: List[int]) -> pd.DataFrame:
     cols = ["episode_index", "task_index", "length", "raw_episode_id", "data/chunk_index", "data/file_index"]
     eps = pd.concat([pq.read_table(f, columns=cols).to_pandas() for f in files], ignore_index=True)
     return eps[eps["task_index"].isin(tasks)].sort_values("episode_index").reset_index(drop=True)
+
+
+def subtask_rows(root: Path, task: int, raw_id: int, length: int) -> Tuple[List[dict], Optional[str]]:
+    """Segment-start rows (episode, frame, subtask) from the skill annotation."""
+    from bgdata.cot_targets import subtask_text
+    from bgdata.inventory import segments
+    from bgdata.operators import OP_ARGS, TEXT
+
+    path = root / "annotations" / f"task-{task:04d}" / f"episode_{raw_id:08d}.json"
+    if not path.exists():
+        return [], "missing"
+    ops = {op: {"args": args, "text": TEXT[op]} for op, args in OP_ARGS.items()}
+    rows, last_end = [], 0
+    for seg in sorted(segments(json.loads(path.read_text())), key=lambda s: s["start"]):
+        # an object slot can hold a list (several objects handled together)
+        seg["objects"] = [" and ".join(o) if isinstance(o, list) else o for o in seg["objects"]]
+        start = int(seg["start"])
+        if not 0 <= start < length:
+            continue
+        rows.append({"episode": raw_id, "frame": start, "subtask": subtask_text(seg, ops)})
+        last_end = max(last_end, int(seg["end"]))
+    if rows and last_end < length:
+        rows.append({"episode": raw_id, "frame": last_end, "subtask": "done"})
+    return rows, None if rows else "empty"
 
 
 def read_bbox(bbox_root: Path, task: int, raw_id: int, length: int, key: str) -> Tuple[Dict[int, dict], Optional[str]]:
@@ -221,6 +250,7 @@ def main() -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--bbox-dir", type=Path, help=f"default <demos-root>/{BBOX_DIR}")
     ap.add_argument("--ee-pose-dir", type=Path, help=f"default <demos-root>/{EE_DIR}")
+    ap.add_argument("--no-subtask", action="store_true")
     ap.add_argument("--no-bbox", action="store_true")
     ap.add_argument("--no-trace", action="store_true")
     ap.add_argument("--bbox-key", default="bbox", choices=["bbox", "raw_bbox"])
@@ -239,8 +269,10 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     log(f"head camera {args.camera}: {args.image_size}px, fx = {fx:.2f}")
 
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))  # bgdata
     eps = read_episodes(root, args.tasks)
     coverage: Dict[str, dict] = {}
+    subtasks: List[dict] = []
     for task, task_eps in eps.groupby("task_index"):
         task = int(task)
         if args.max_episodes:
@@ -255,6 +287,14 @@ def main() -> int:
         for row in task_eps.itertuples():
             ep, raw_id, length = int(row.episode_index), int(row.raw_episode_id), int(row.length)
             records: Dict[int, Dict[str, dict]] = defaultdict(dict)
+
+            if not args.no_subtask:
+                rows, reason = subtask_rows(root, task, raw_id, length)
+                if reason:
+                    skips[f"subtask:{reason}"].append(raw_id)
+                else:
+                    subtasks.extend(rows)
+                    stats["subtask_episodes"] += 1
 
             if not args.no_bbox:
                 boxes, reason = read_bbox(bbox_root, task, raw_id, length, args.bbox_key)
@@ -292,14 +332,18 @@ def main() -> int:
         coverage[str(task)] = {**stats, "skipped": {k: v for k, v in skips.items()}}
         f = max(stats["frames"], 1)
         log(
-            f"task {task}: {stats['episodes_written']}/{len(task_eps)} episodes written; "
+            f"task {task}: subtask {stats['subtask_episodes']}/{len(task_eps)} episodes; "
+            f"bbox/trace {stats['episodes_written']}/{len(task_eps)} episodes; "
             f"bbox {stats['bbox_frames']} frames ({100 * stats['bbox_frames'] / f:.2f}%), "
             f"trace {stats['trace_frames']} ({100 * stats['trace_frames'] / f:.1f}%); "
             f"skipped {', '.join(f'{k}={len(v)}' for k, v in skips.items()) or 'none'}"
         )
 
     (args.out / "coverage.json").write_text(json.dumps(coverage, indent=2) + "\n")
-    if not any(c.get("episodes_written") for c in coverage.values()):
+    if subtasks:
+        pd.DataFrame(subtasks).to_parquet(args.out / "subtask_targets.parquet", index=False)
+        log(f"subtask_targets.parquet: {len(subtasks)} segment rows")
+    if not subtasks and not any(c.get("episodes_written") for c in coverage.values()):
         log("no episode produced any label")
         return 1
     log(f"wrote {args.out}")

@@ -1,14 +1,13 @@
 # @package _global_
-# behavior_cot_lora.yaml with the belief-graph CoT targets switched ON.
-# Identical except the candidate list: BBox + 2D trace + the output-only belief-graph
-# targets of behavior_cot_v2.yaml (same builders, same weights). There is still no
-# BeliefGraph input slot, so inference needs no belief runtime.
+# behavior_cot_lora.yaml with the belief-graph CoT targets switched ON, i.e. exactly the
+# behavior_cot_v2.yaml candidate list and weights (LoRA + AR/FM from behavior_cot_lora.yaml).
+# There is still no BeliefGraph input slot, so inference needs no belief runtime.
 #
 #     TASK_CONFIG=behavior_cot_lora_bg bash scripts/train_g05_cot.sh <EXP> ...
 #
-# Needs bg_{delta,belief,observe,effect}_index in the dataset (merge_b1k_cot_labels.py
+# Needs bg_{delta,belief,observe,effect}_index in the dataset (build_cot_bbox_trace.sh
 # --bg-targets). Without them these candidates are simply never applicable.
-# Hydra replaces lists wholesale, so the BBox / trace candidates are repeated here.
+# Hydra replaces lists wholesale, so the whole list is repeated here.
 defaults:
 - behavior_cot_lora
 - _self_
@@ -17,6 +16,12 @@ model:
   processor:
     samples_builder:
       candidates:
+      - _target_: g05.data_processor.processor.samples_builder.AtomicTaskBaseSamplesBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.BBoxSubtaskCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder
+        weight: 1.0
       - _target_: g05.data_processor.processor.samples_builder.BBoxCoTBuilder
         weight: 1.0
       - _target_: g05.data_processor.processor.samples_builder.Trace2DCoTBuilder
@@ -32,4 +37,6 @@ model:
       - _target_: g05.data_processor.processor.samples_builder.FullBeliefCoTBuilder
         weight: 0.2
       - _target_: g05.data_processor.processor.samples_builder.ObserveUpdateCoTBuilder
+        weight: 0.4
+      - _target_: g05.data_processor.processor.samples_builder.SubtaskEffectCoTBuilder
         weight: 0.4
