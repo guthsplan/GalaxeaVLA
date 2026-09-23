@@ -10,8 +10,9 @@ Inputs (all under the challenge demos root, $B1K_RAW_DEMOS)
     and ``filtering`` are dropped. Episodes whose report is incomplete, not ``packable`` or
     has ``length_2025 != length_2026`` are skipped (the 2025 masks would be misaligned).
 * ``behavior_ee_pose_0_99/task-XXXX/frames/chunk-*/file-*.parquet``
-    30 Hz ``observation.ee_pose.{left,right}`` = [x, y, z, qx, qy, qz, qw] in the robot frame,
-    keyed by the 2026 ``episode_index``.
+    30 Hz ``observation.ee_pose.{left,right}`` = [x, y, z, qx, qy, qz, qw] in the robot frame.
+    Its ``episode_index`` is the per-task ``demo_index_within_task`` (0..199), not the dataset's
+    global episode_index (they coincide only for task 0); the namespace is detected per task.
 * ``data/chunk-*/file-*.parquet`` column ``observation.robot2cam_pose.<camera>``
     30 Hz camera pose in the same robot frame (USD camera convention: -Z forward, +Y up).
 * ``annotations/task-XXXX/episode_<raw_id>.json`` ``skill_annotation``
@@ -74,30 +75,85 @@ def log(msg: str) -> None:
 
 def read_episodes(root: Path, tasks: List[int]) -> pd.DataFrame:
     files = sorted((root / "meta" / "episodes").glob("*/*.parquet"))
-    cols = ["episode_index", "task_index", "length", "raw_episode_id", "data/chunk_index", "data/file_index"]
+    cols = ["episode_index", "task_index", "length", "raw_episode_id", "demo_index_within_task",
+            "data/chunk_index", "data/file_index"]
     eps = pd.concat([pq.read_table(f, columns=cols).to_pandas() for f in files], ignore_index=True)
     return eps[eps["task_index"].isin(tasks)].sort_values("episode_index").reset_index(drop=True)
 
 
+#: Subtask templates for skills bgdata.operators has no operator for (bgdata would emit the
+#: bare skill name). {0}, {1}, ... are the annotation's object_id slots, in order.
+EXTRA_SUBTASK_TEXT = {
+    "open lid": "open lid {0}",
+    "close lid": "close lid {0}",
+    "hand over": "hand over {0} from {1} to {2} hand",
+    "turn to": "turn {0} to {1}",
+    "push to": "push {0} to {1}",
+    "place on next to": "place {0} on {1} next to {2}",
+    "chop": "chop {1} with {0}",
+    "sweep off": "sweep {0} off {1}",
+}
+
+
+def _skill_segments(ann: dict) -> List[dict]:
+    """bgdata.inventory.segments, but a skill annotated over several frame intervals
+    (``frame_duration: [[s0, e0], [s1, e1]]``) becomes one segment per interval."""
+    out = []
+    for sk in ann["skill_annotation"]:
+        durations = sk["frame_duration"]
+        if durations and isinstance(durations[0], list):
+            intervals = [tuple(d) for d in durations]
+        else:
+            intervals = [tuple(durations)]
+        objects = list(sk["object_id"][0]) if sk["object_id"] else []
+        # an object slot can hold a list (several objects handled together)
+        objects = [" and ".join(o) if isinstance(o, list) else o for o in objects]
+        for start, end in intervals:
+            out.append(dict(
+                skill=sk["skill_description"][0],
+                objects=objects,
+                memory_prefix=(sk["memory_prefix"] or [""])[0],
+                start=int(start),
+                end=int(end),
+            ))
+    return sorted(out, key=lambda seg: seg["start"])
+
+
+def _subtask_text(seg: dict, ops: dict) -> str:
+    from bgdata.cot_targets import subtask_text
+    from bgdata.operators import SKILL_TO_OP
+
+    if seg["skill"] in SKILL_TO_OP:  # the belief-graph pipeline's own text, verbatim
+        return subtask_text(seg, ops)
+    template = EXTRA_SUBTASK_TEXT.get(seg["skill"])
+    objs = seg["objects"]
+    if template is not None:
+        try:
+            return template.format(*objs)
+        except IndexError:
+            pass
+    return " ".join([seg["skill"], *objs])
+
+
 def subtask_rows(root: Path, task: int, raw_id: int, length: int) -> Tuple[List[dict], Optional[str]]:
     """Segment-start rows (episode, frame, subtask) from the skill annotation."""
-    from bgdata.cot_targets import subtask_text
-    from bgdata.inventory import segments
     from bgdata.operators import OP_ARGS, TEXT
 
     path = root / "annotations" / f"task-{task:04d}" / f"episode_{raw_id:08d}.json"
     if not path.exists():
         return [], "missing"
     ops = {op: {"args": args, "text": TEXT[op]} for op, args in OP_ARGS.items()}
-    rows, last_end = [], 0
-    for seg in sorted(segments(json.loads(path.read_text())), key=lambda s: s["start"]):
-        # an object slot can hold a list (several objects handled together)
-        seg["objects"] = [" and ".join(o) if isinstance(o, list) else o for o in seg["objects"]]
-        start = int(seg["start"])
-        if not 0 <= start < length:
+    rows: List[dict] = []
+    last_end = 0
+    for seg in _skill_segments(json.loads(path.read_text())):
+        if not 0 <= seg["start"] < length:
             continue
-        rows.append({"episode": raw_id, "frame": start, "subtask": subtask_text(seg, ops)})
-        last_end = max(last_end, int(seg["end"]))
+        text = _subtask_text(seg, ops)
+        if rows and rows[-1]["frame"] == seg["start"]:
+            rows[-1]["subtask"] = text  # two segments starting on one frame: the later wins
+        else:
+            rows.append({"episode": raw_id, "frame": seg["start"], "subtask": text})
+        last_end = max(last_end, seg["end"])
     if rows and last_end < length:
         rows.append({"episode": raw_id, "frame": last_end, "subtask": "done"})
     return rows, None if rows else "empty"
@@ -150,6 +206,21 @@ class EEPoseTable:
 
     def available(self, task: int) -> bool:
         return any((self.ee_root / f"task-{task:04d}" / "frames").glob("chunk-*/*.parquet"))
+
+    def resolve_keys(self, task: int, task_eps: pd.DataFrame) -> Dict[int, int]:
+        """global episode_index -> the key this task's EE-pose files use for it."""
+        self.get(task, -1)
+        have = set(self.cache[task])
+        global_ids = [int(e) for e in task_eps["episode_index"]]
+        local_ids = [int(e) for e in task_eps["demo_index_within_task"]]
+        if have <= set(global_ids) and have & set(global_ids):
+            return dict(zip(global_ids, global_ids))
+        if have <= set(local_ids):
+            return dict(zip(global_ids, local_ids))
+        raise ValueError(
+            f"task {task}: EE-pose episode_index values {sorted(have)[:5]}... match neither the "
+            f"global episode_index nor demo_index_within_task of this task"
+        )
 
     def get(self, task: int, episode: int):
         if task not in self.cache:
@@ -281,6 +352,7 @@ def main() -> int:
         if not args.no_trace and not do_trace:
             log(f"task {task}: no EE poses under {ee.ee_root}/task-{task:04d} -> bbox only")
         cams = read_cam_poses(root, task_eps, args.camera) if do_trace else {}
+        ee_key = ee.resolve_keys(task, task_eps) if do_trace else {}
 
         stats = defaultdict(int)
         skips: Dict[str, List[int]] = defaultdict(list)
@@ -305,7 +377,7 @@ def main() -> int:
                 stats["bbox_frames"] += len(boxes)
 
             if do_trace:
-                pose = ee.get(task, ep)
+                pose = ee.get(task, ee_key[ep])
                 cam = cams.get(ep)
                 if pose is None or cam is None:
                     skips["trace:missing"].append(raw_id)
