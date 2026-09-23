@@ -587,6 +587,17 @@ def finetune(cfg: DictConfig):
     # Force critical layers to float32 (patterns defined per-model in fp32_param_patterns)
     model.apply_fp32_params()
 
+    # LoRA: inject adapters into the loaded weights and freeze the rest. Before EMA /
+    # DDP / optimizer, which all capture the parameter set (see g05/models/g05/lora.py).
+    lora_cfg = cfg.model.get("lora", None)
+    lora_grads_unchecked = bool(lora_cfg is not None and lora_cfg.get("enabled", False))
+    if lora_grads_unchecked:
+        from g05.models.g05.lora import apply_lora, check_adapter_grads, summarize_trainable
+
+        apply_lora(model, lora_cfg, resume_checkpoint=checkpoint if cfg.resume_ckpt else None)
+        for line in summarize_trainable(model):
+            logger.info(f"  trainable {line}")
+
     use_ema = cfg.model.use_ema
     if use_ema:
         ema_model = EMA(
@@ -1198,6 +1209,11 @@ def finetune(cfg: DictConfig):
                 batch_idx += 1
 
                 if is_optimizer_step:
+                    if lora_grads_unchecked:
+                        # An adapter whose base Linear is bypassed (F.linear on .weight) never
+                        # sees a gradient; fail on the first step rather than train it silently.
+                        check_adapter_grads(unwrap_model(model))
+                        lora_grads_unchecked = False
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), cfg.model.max_grad_norm
                     )

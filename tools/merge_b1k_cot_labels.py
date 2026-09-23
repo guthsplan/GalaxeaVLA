@@ -565,6 +565,7 @@ def merge(
     rows: SourceRows,
     max_staleness: Optional[int],
     dry_run: bool,
+    episode_key: str = "auto",
 ) -> None:
     geom = read_geometry(dataset)
     log(f"dataset : {dataset}")
@@ -573,7 +574,14 @@ def merge(
     # Both label sources key episodes by raw_episode_id (the demo_id, e.g. 450010),
     # a different namespace from LeRobot's episode_index. Remap through
     # meta/episodes when the keys are not already episode indices.
-    if rows and not set(rows) <= set(geom.ranges) and geom.raw_to_episode:
+    # `auto` remaps only when some key is not an episode index, which is ambiguous when
+    # raw ids happen to be small (task 0: 10, 20, ...); `raw` / `index` say it explicitly.
+    if episode_key == "raw" and not geom.raw_to_episode:
+        sys.exit("--sidecar-episode-key raw: the dataset's meta/episodes has no raw_episode_id column")
+    remap = episode_key == "raw" or (
+        episode_key == "auto" and not set(rows) <= set(geom.ranges) and geom.raw_to_episode
+    )
+    if rows and remap:
         remapped: SourceRows = {}
         unmapped = []
         for key, frames in rows.items():
@@ -774,6 +782,13 @@ def main() -> int:
         default=None,
         help="drop snapshot labels (bg_known/bg_belief/bg_observe) held forward longer than this",
     )
+    ap.add_argument(
+        "--sidecar-episode-key",
+        choices=["auto", "raw", "index"],
+        default="auto",
+        help="namespace of the label sources' episode keys: raw_episode_id (e.g. 450010), "
+        "the dataset's episode_index, or auto-detect",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -795,7 +810,7 @@ def main() -> int:
         if args.cot_sidecar_dir:
             read_cot_sidecars(args.cot_sidecar_dir, rows)
 
-    merge(args.dataset, rows, args.max_staleness_frames, args.dry_run)
+    merge(args.dataset, rows, args.max_staleness_frames, args.dry_run, args.sidecar_episode_key)
     return 0
 
 

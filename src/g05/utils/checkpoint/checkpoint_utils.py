@@ -729,15 +729,21 @@ def save_training_checkpoint(
     output_dir = Path(output_dir)
     path = output_dir / "checkpoints" / f"step_{step}.pt"
     path.parent.mkdir(parents=True, exist_ok=True)
+    # LoRA runs are saved merged, in the plain layout, so they load like any other
+    # checkpoint; the raw adapters ride along only for resume (models/g05/lora.py).
+    from g05.models.g05.lora import adapter_state_dict, export_state_dict, has_lora
+
     state = {
         "step": step,
         "epoch": epoch,
         "batch_idx": batch_idx,
-        "model_state_dict": model.state_dict() if model is not None else None,
+        "model_state_dict": export_state_dict(model) if model is not None else None,
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
-        "ema_model_state_dict": ema_model.ema_model.state_dict() if ema_model is not None else None,
+        "ema_model_state_dict": export_state_dict(ema_model.ema_model) if ema_model is not None else None,
     }
+    if model is not None and has_lora(model):
+        state["lora_state_dict"] = adapter_state_dict(model)
     state.update(extra_state)
     torch.save(state, path)
 
@@ -771,7 +777,8 @@ def fix_optimizer_state_after_resume(optimizer) -> int:
                 if isinstance(v, torch.Tensor):
                     if v.is_floating_point() and v.dtype != p.dtype:
                         state[k] = v.to(dtype=p.dtype)
-                    if v.shape != p.shape:
+                    # 0-dim entries (Adam's `step`) are per-param scalars, not param-shaped
+                    if v.dim() > 0 and v.shape != p.shape:
                         need_reset = True
             if need_reset:
                 reset_count += 1
