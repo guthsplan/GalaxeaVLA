@@ -16,6 +16,7 @@ Object naming in every predicate target is the scene INSTANCE id exactly as the 
 annotations and the Subtask: target spell it (fridge_dszchb_0, hotdog_207, ...). SHORT is kept
 only so `shorten()` stays importable; it must stay empty.
 """
+import gzip
 import json
 import pathlib
 
@@ -116,11 +117,15 @@ def main(out_dir: str = "out/task045", task: int = 45):
     parts = []
     for ep in inv["episodes"]:
         ep_id = str(ep["raw_episode_id"])
-        tp = out / f"belief_trace_{ep_id}.jsonl"
+        tp = out / f"belief_trace_{ep_id}.jsonl.gz"
+        if not tp.exists():
+            tp = out / f"belief_trace_{ep_id}.jsonl"
         if not tp.exists():
             continue
         segs = segs_by_ep.get(ep_id, [])
-        recs = [json.loads(l) for l in open(tp)]
+        opener = gzip.open if tp.suffix == ".gz" else open
+        with opener(tp, "rt") as fh:
+            recs = [json.loads(l) for l in fh]
         for r in recs:
             if r["step"] % 30 != 0:  # 1 Hz targets from the 10 Hz trace
                 continue

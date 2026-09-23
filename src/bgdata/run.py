@@ -8,6 +8,7 @@ are fitted on the first --fit-episodes episodes, then each episode is decoded, l
 after operator extraction.
 """
 import argparse
+import gzip
 import json
 import pathlib
 import time
@@ -45,6 +46,7 @@ def main(argv=None):
     ap.add_argument("--episodes", default="5")
     ap.add_argument("--fit-episodes", type=int, default=20)
     ap.add_argument("--no-sidecar", action="store_true")
+    ap.add_argument("--truth-json", action="store_true", help="also write truth_<ep>.json.gz")
     args = ap.parse_args(argv)
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -116,9 +118,11 @@ def main(argv=None):
         label_dfs[ep_id] = df
         segs_by_ep[ep_id] = ed.segments
         n_frames[ep_id] = ed.N
-        truth = truth_from_labels(df)
-        tj = {str(fr): {k: [v, vis] for k, (v, vis) in d.items()} for fr, d in truth.items()}
-        (out / f"truth_{ep_id}.json").write_text(json.dumps(tj))
+        if args.truth_json:  # 10 Hz truth dump is ~100 MB/episode: opt-in (predicates.parquet has it)
+            truth = truth_from_labels(df)
+            tj = {str(fr): {k: [v, vis] for k, (v, vis) in d.items()} for fr, d in truth.items()}
+            with gzip.open(out / f"truth_{ep_id}.json.gz", "wt") as f:
+                json.dump(tj, f)
         summary.setdefault("decode_stats", {})[str(ep_id)] = ed.decode_stats
         eds_iter[ep_id] = None
         del ed
@@ -179,7 +183,7 @@ def main(argv=None):
         truth = truth_from_labels(df)
         recs, chlog = belief_trace.run_trace(
             truth, segs_by_ep[ep_id], ops_json, tg.init_lines, tg,
-            out / f"belief_trace_{ep_id}.jsonl")
+            out / f"belief_trace_{ep_id}.jsonl.gz")
         final_progress.append(recs[-1]["progress"] if recs else 0.0)
         if vocab is None:
             vocab = sidecar.build_vocab({ep_id: recs}, gout["goal_lines"], extra_keys=summary["keys"])

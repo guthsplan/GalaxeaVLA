@@ -8,6 +8,7 @@ annotation segment ends. NO time decay: confidence changes only via
 Internal representation: value (bool) + conf (confidence that stored value is correct).
 Exported p_true = conf if value else 1 - conf.
 """
+import gzip
 import json
 
 from .config import (DISTURB_FACTOR, DISTURB_FLOOR, OBS_CONF_TRUE, PRIOR_CONF,
@@ -118,7 +119,8 @@ def run_trace(truth: dict[int, dict], segments: list[dict], ops_json: dict,
     seg_ends = sorted([s for s in segments if seg_op(s) is not None], key=lambda s: s["end"])
     si = 0
     records = []
-    with open(out_jsonl, "w") as f:
+    opener = gzip.open if str(out_jsonl).endswith(".gz") else open
+    with opener(out_jsonl, "wt") as f:
         for fr in frames:
             observed = sim.observe(fr, truth[fr])
             while si < len(seg_ends) and seg_ends[si]["end"] <= fr:
