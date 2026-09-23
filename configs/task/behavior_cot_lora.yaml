@@ -2,8 +2,8 @@
 # G0.5 CoT LoRA fine-tuning on BEHAVIOR: behavior_cot_v2's CoT mix WITHOUT the belief-graph
 # targets, AR + FM.
 #
-# Inherits behavior_cot_v2.yaml (no BeliefGraph input slot, predict_cot, pred_eov, gripper
-# no-op dropout disabled) and changes three things:
+# Inherits behavior_cot_v2.yaml (no BeliefGraph input slot, predict_cot, pred_eov) and changes
+# four things:
 #
 #   1. CoT mix  -> the non-belief-graph builders of behavior_cot_v2 (same weights):
 #                  AtomicTaskBase, BBoxSubtask, Subtask, BBox, Trace2D. Dropped: Delta, Update,
@@ -13,7 +13,12 @@
 #                  loss = ar.ce_weight * ce_loss + fm.fm_weight * fm_loss (g05_policy.py).
 #                  At inference the executed action is the FM one (generate_action keeps
 #                  results["action"] from inference_fm; the AR decode goes to "ar_action").
-#   3. LoRA     -> adapters on the VLM decoder AND the action expert (attention, MLP).
+#   3. Gripper  -> rule_based_key_patterns: [gripper] (as behavior.yaml / g05_all100), i.e. the
+#                  v2 gripper no-op-dropout fix is REVERTED here. Executed actions come from FM,
+#                  whose loss always covers the gripper dims, so the dropout only thins the AR
+#                  auxiliary targets; in exchange the ActionCodec token layout matches g05_all100
+#                  and its AR action rows load 1:1 (no token remap).
+#   4. LoRA     -> adapters on the VLM decoder AND the action expert (attention, MLP).
 #                  Fully trained: the action expert's adaLN modulation (cannot take an adapter,
 #                  see lora.py), 27-D I/O projections and time MLP, plus the proprio embedder.
 #                  Vision tower and embeddings frozen (g05/models/g05/lora.py).
@@ -82,3 +87,9 @@ model:
       # BBoxCoTBuilder / AtomicTaskBase cannot be: their eval_required_fields need labels.
       eval_builder:
         _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder
+
+tokenizer:
+  vq_config:
+    # Back to behavior.yaml's value (behavior_cot_v2.yaml sets []). See point 3 above.
+    rule_based_key_patterns:
+    - gripper
