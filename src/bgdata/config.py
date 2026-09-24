@@ -36,7 +36,9 @@ class Thresholds:
     # --- reachable (fitted) ---
     reach_dist: float = None                   # fitted: 95th pct of base-target horizontal distance
     reach_dist_default: float = 1.5
-    reach_margin: float = 1.15                 # multiplicative margin on the p95
+    reach_margin: float = 1.15                 # multiplicative margin on the fitted percentile
+    reach_percentile: float = 75.0             # of base->target distances at manipulation segment starts
+    reach_dist_max: float = 2.0                # m, hard cap (R1 Pro arm reach + base footprint)
     # --- onfloor ---
     floor_z_max: float = 0.10                  # m, object bottom below this counts as on floor
     # --- visibility (geometric proxy; replaces GT-seg pixel count) ---

@@ -649,12 +649,15 @@ def fit_thresholds(eds: list[EpisodeData], thr: Thresholds) -> tuple[dict, dict]
             lo, hi = np.nanmin(q, axis=0), np.nanmax(q, axis=0)
             jr_lo[n] = np.minimum(jr_lo.get(n, lo), lo)
             jr_hi[n] = np.maximum(jr_hi.get(n, hi), hi)
-            jr_hist.setdefault(n, []).append(np.nanmedian(q, axis=0))
+            first = int(np.argmax(np.all(np.isfinite(q), axis=1))) if np.isfinite(q).all(axis=1).any() else 0
+            jr_hist.setdefault(n, []).append(q[first])  # doors/drawers start closed in every task instance
     joint_ranges = {}
     for n in jr_lo:
-        med = np.nanmedian(np.stack(jr_hist[n]), axis=0)
+        q0 = np.nanmedian(np.stack(jr_hist[n]), axis=0)
         span = jr_hi[n] - jr_lo[n]
-        closed_low = np.abs(med - jr_lo[n]) <= np.abs(med - jr_hi[n])
+        # closed end = the side the joint rests on at episode start (the median over the episode
+        # is wrong for a door that stays open most of the demo)
+        closed_low = np.abs(q0 - jr_lo[n]) <= np.abs(q0 - jr_hi[n])
         joint_ranges[n] = dict(lo=jr_lo[n].tolist(), hi=jr_hi[n].tolist(),
                                closed_low=closed_low.tolist(), span=span.tolist())
     if carry_dists and not any_ag and eds[0].proprio is not None:
@@ -662,10 +665,12 @@ def fit_thresholds(eds: list[EpisodeData], thr: Thresholds) -> tuple[dict, dict]
         grip_closed = float(np.percentile(carry_grips, 95))
     else:
         grasp_dist, grip_closed = thr.grasp_dist_default, thr.gripper_closed_default
-    reach_p95 = float(np.percentile(reach_ds, 95)) if reach_ds else thr.reach_dist_default
+    # annotators often start a manipulation segment while the base is still approaching, so the
+    # upper tail of base->target distances is not "reachable": use p75 with a hard cap
+    reach_p = float(np.percentile(reach_ds, thr.reach_percentile)) if reach_ds else thr.reach_dist_default
     fitted = dict(
         grasp_dist=grasp_dist, gripper_closed_sum=grip_closed,
-        reach_dist=reach_p95 * thr.reach_margin, reach_dist_p95_raw=reach_p95,
+        reach_dist=min(reach_p * thr.reach_margin, thr.reach_dist_max), reach_dist_p95_raw=reach_p,
         joint_ranges=joint_ranges,
         inhand_source="assisted_grasp" if any_ag else ("geometric" if eds[0].proprio is not None else "none"),
         proprio_source=eds[0].proprio_source,
@@ -674,7 +679,8 @@ def fit_thresholds(eds: list[EpisodeData], thr: Thresholds) -> tuple[dict, dict]
         grasp_dist=("unused: inhand comes from the assisted-grasp constraint in the raw state" if any_ag
                     else "95th pct of min-arm EEF-object distance over carry windows (pick end -> place end)"),
         gripper_closed_sum="95th pct of holding-arm gripper qpos sum over the same windows",
-        reach_dist=f"95th pct of base-target horizontal distance at manipulation segment starts x{thr.reach_margin}",
+        reach_dist=f"p{thr.reach_percentile} of base->target AABB distance at manipulation segment starts "
+                   f"x{thr.reach_margin}, capped at {thr.reach_dist_max} m",
         joint_ranges="observed [min,max] per joint over the fit episodes; closed end = side the median rests on",
         n_carry_samples=len(carry_dists), n_reach_samples=len(reach_ds),
     )
