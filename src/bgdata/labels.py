@@ -101,7 +101,8 @@ class EpisodeData:
             self.proprio = None
             self.cams = None
             self.proprio_source = "none"
-        assert self.n_raw in (self.N, self.N + 1), \
+        # demo frames == raw frames - 1 normally; a handful of recordings differ by a few frames
+        assert 0 <= self.n_raw - self.N <= 5, \
             f"raw/demo length mismatch: raw {self.n_raw} vs demo {self.N} ({ep['raw_path']})"
         N = self.N
         self.pos = {n: self.series[n]["pos"][:N] for n in names}
