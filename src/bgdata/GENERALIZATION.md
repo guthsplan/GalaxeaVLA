@@ -78,7 +78,24 @@ door → open, switch → toggled_on)로 task 단위로 한 번 결정한다.
   parquet이 없으면 `proprio_source="none"` 폴백(로봇 base·AG는 raw에서, 카메라는 명목 pose,
   geometric inhand 비활성)으로 라벨을 만든다. 학습 병합(`build_cot_dataset.sh`)에는 parquet이 필요.
 
-## 6. 알려진 한계
+## 6. 검증·전체 실행 결과 (2026-09-24)
+
+**검증 (100 task × 2 에피소드, `VALIDATION_2ep.md`)**
+* 100/100 task 실행 성공, 디코드 실패 에피소드 0, 총 23분(6병렬).
+* 데모 마지막 프레임에서 goal이 GT 라벨로 완전히 만족되는 task **86/100**. 미완성은 `exists` 아래
+  conjunction(task 8: 캐비닛 문이 열린 채 종료, 70, 77), transition product의 `ontop`(49 pizza, 62 half egg —
+  생성 객체의 scene 이름을 모름), `nextto/under` 임계(5, 6, 89), 입자 `filled/contains`(48).
+* task 45는 v1(task 전용 코드) 라벨과 key별 값 일치도 평균 0.985(`reachable/visited countertop`만
+  앵커→AABB 거리 변경으로 차이).
+
+**전체 실행 (100 task × 전체 에피소드, `VALIDATION_full.md`, `/data0/hoyong/b1k_data/bg_out`)**
+* 20,000/20,000 에피소드(task 38의 1개는 raw/demo 길이 3프레임 차이 → 허용 후 재실행),
+  `cot_targets_all.parquet` 7,040,194 행(1 Hz), 출력 9.9 GB, 20병렬 약 4.5시간(CPU 합계 95.7시간).
+* belief trace 기준 `final_progress` 평균 0.954, 66 task는 모든 에피소드에서 1.0; task 8만 0.
+* `accum_mismatch` 평균 0.131(에피소드 2개일 때와 비슷 — 표본 수가 아니라 규칙 잔차),
+  `memory_prefix` 검증 통과율 평균 0.69, `observe_none>0.5`·`subtask_fallback>0.2` task 없음.
+
+## 7. 알려진 한계
 
 * 입자계 predicate은 종료 신호로만 채움(관측 불가).
 * exists/forn over conjunction은 카운트 근사; `or` 하위 literal은 성공 시점 강제 대상이 아님.
