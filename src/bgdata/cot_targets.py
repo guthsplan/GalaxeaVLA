@@ -130,7 +130,11 @@ def main(out_dir: str = "out/task045", task: int = 45):
             if r["step"] % 30 != 0:  # 1 Hz targets from the 10 Hz trace
                 continue
             fr = r["step"]
+            # the segment containing the frame; in a gap (before the first skill or between two
+            # skills) the target is the NEXT skill -- 'done' only after the last one ends
             seg = next((s for s in segs if s["start"] <= fr < s["end"]), None)
+            if seg is None:
+                seg = next((s for s in sorted(segs, key=lambda s: s["start"]) if s["start"] > fr), None)
             parts.append(dict(
                 task=task, episode=int(ep_id), frame=fr,
                 subtask=f"Subtask: {subtask_text(seg, ops_json)}",
