@@ -18,6 +18,8 @@ import pandas as pd
 
 PRE_SUPPORT = 0.95
 EFF_SUPPORT = 0.85
+MIN_APPLICABLE = 5        # segments where the effect could flip, needed before it is trusted
+MIN_APPLICABLE_FRAC = 0.1  # ... and at least this fraction of the op's segments
 SETTLE = 6  # frames (30 fps) after segment end before sampling the post state
 
 # skill text -> (operator name, argument names, Subtask text template)
@@ -165,11 +167,25 @@ def extract_operators(label_dfs: dict[int, pd.DataFrame], segs_by_ep: dict[int, 
         for k in sorted(keys):
             true_at_start = np.mean([r["pre"].get(k, False) for r in recs])
             defined = [r for r in recs if k in r["pre"] and k in r["post"]]
-            pos_change = np.mean([(not r["pre"][k]) and r["post"][k] for r in defined]) if defined else 0
-            neg_change = np.mean([r["pre"][k] and (not r["post"][k]) for r in defined]) if defined else 0
+            # an effect is judged where it is APPLICABLE: a door already open when the second
+            # "open door" segment starts cannot flip again (the unconditional flip rate then
+            # saturates at 50 % and the effect would be lost)
+            app_pos = [r for r in defined if not r["pre"][k]]
+            app_neg = [r for r in defined if r["pre"][k]]
+            true_at_end = np.mean([r["post"][k] for r in defined]) if defined else 0
+            min_app = max(MIN_APPLICABLE, MIN_APPLICABLE_FRAC * len(defined))
+            pos_change = np.mean([r["post"][k] for r in app_pos]) if len(app_pos) >= min_app else 0
+            neg_change = np.mean([not r["post"][k] for r in app_neg]) if len(app_neg) >= min_app else 0
+            # ... and must hold at the end of (nearly) every segment, else it is not this op's effect
+            if true_at_end < EFF_SUPPORT:
+                pos_change = 0
+            if true_at_end > 1 - EFF_SUPPORT:
+                neg_change = 0
             support[k] = (true_at_start, pos_change, neg_change)
             stats_rows.append(dict(op=op, predicate=k, n_segments=n,
                                    support_pre_true=round(float(true_at_start), 3),
+                                   support_post_true=round(float(true_at_end), 3),
+                                   n_applicable_pos=len(app_pos), n_applicable_neg=len(app_neg),
                                    support_eff_pos=round(float(pos_change), 3),
                                    support_eff_neg=round(float(neg_change), 3)))
         for k, (t0, pos, neg) in support.items():

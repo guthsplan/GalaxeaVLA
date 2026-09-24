@@ -47,6 +47,9 @@ def main(argv=None):
     ap.add_argument("--fit-episodes", type=int, default=20)
     ap.add_argument("--no-sidecar", action="store_true")
     ap.add_argument("--truth-json", action="store_true", help="also write truth_<ep>.json.gz")
+    ap.add_argument("--from-labels", action="store_true",
+                    help="reuse <out>/predicates.parquet + segments_resolved.json (skip decode/labels) "
+                         "and redo operators, goal, belief traces and sidecar")
     args = ap.parse_args(argv)
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -76,6 +79,22 @@ def main(argv=None):
     print(f"[inventory] task {args.task} ({inv['task_name']}): {len(eps)} episodes; "
           f"relevant objects {len(spec.relevant)}; unresolved tokens {spec.unresolved_tokens}")
     timing["inventory"] = time.time() - t0
+
+    if args.from_labels:
+        t = time.time()
+        all_labels = pd.read_parquet(out / "predicates.parquet")
+        label_dfs = {int(ep): df.reset_index(drop=True) for ep, df in all_labels.groupby("episode")}
+        segs_by_ep = {int(k): v for k, v in json.loads((out / "segments_resolved.json").read_text()).items()}
+        n_frames = {ep: int(df.frame.max()) + 3 for ep, df in label_dfs.items()}
+        failed = []
+        summary.update(episodes=len(label_dfs), episodes_failed=[], label_rows=int(len(all_labels)),
+                       n_keys=int(all_labels.key.nunique()), keys=sorted(all_labels.key.unique().tolist()),
+                       from_labels=True)
+        print(f"[from-labels] {len(label_dfs)} episodes, {summary['n_keys']} keys")
+        del all_labels
+        timing["load_labels"] = time.time() - t
+        _stages_after_labels(args, out, inv, spec, tg, thr, label_dfs, segs_by_ep, n_frames, summary, timing, t0)
+        return
 
     # 2. fit on the first K episodes -----------------------------------------------------
     t = time.time()
@@ -146,6 +165,10 @@ def main(argv=None):
         [not s["resolved_all"] for segs in segs_by_ep.values() for s in segs] or [0.0]))
     del all_labels
 
+    _stages_after_labels(args, out, inv, spec, tg, thr, label_dfs, segs_by_ep, n_frames, summary, timing, t0)
+
+
+def _stages_after_labels(args, out, inv, spec, tg, thr, label_dfs, segs_by_ep, n_frames, summary, timing, t0):
     # 4. operators --------------------------------------------------------------------------
     t = time.time()
     ops_json, stats = operators.extract_operators(label_dfs, segs_by_ep, n_frames)
