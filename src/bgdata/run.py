@@ -193,7 +193,7 @@ def _stages_after_labels(args, out, inv, spec, tg, thr, label_dfs, segs_by_ep, n
           f"{summary['memory_prefix_pass_rate']} (n={summary['memory_prefix_n']})")
 
     # 5. goal ---------------------------------------------------------------------------------
-    gout = goal.save_goal(args.task, inv["bddl_path"], tg, [e["raw_episode_id"] for e in eps],
+    gout = goal.save_goal(args.task, inv["bddl_path"], tg, sorted(label_dfs),
                           out / f"goal_task{args.task:03d}.json")
     print(f"[goal] {gout['goal_lines']}")
 
