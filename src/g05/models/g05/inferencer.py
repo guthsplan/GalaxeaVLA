@@ -159,7 +159,11 @@ class PolicyInferencer:
         if "action_op_mask" in batch:
             item_batch["action_op_mask"] = batch["action_op_mask"][index : index + 1]
         action = sub_processor.postprocess(item_batch)["action"]
-        ar_absent_keys = batch.get("ar_absent_keys")
+        # ar_absent_keys are parts the AR decode did not emit (e.g. a gripper group removed by
+        # no-op dropout). They only describe the executed action when that action IS the AR
+        # decode; the FM head always predicts every dimension, so dropping them from an FM
+        # action would discard valid gripper commands and freeze the gripper client-side.
+        ar_absent_keys = batch.get("ar_absent_keys") if batch.get("action_source") != "fm" else None
         absent = (
             ar_absent_keys[index]
             if ar_absent_keys is not None and index < len(ar_absent_keys)

@@ -893,6 +893,8 @@ class G05Policy(BasePolicy):
         if self.continuous_action:
             _sync_if_cuda_available()
             t_fm0 = time.monotonic()
+            # Tells the inferencer that ar_absent_keys do not describe the executed action.
+            results["action_source"] = "fm"
             results["action"] = self.model.inference_fm(
                 attention_mask=state.attention_mask,
                 pixel_values=state.pixel_values,
@@ -972,6 +974,7 @@ class G05Policy(BasePolicy):
             results["decoded_action_tokens"] = decoded_tokens
             if "action" not in results:
                 results["action"] = results["ar_action"]
+                results["action_source"] = "ar"
 
             if action_gt is not None:
                 results.update(
