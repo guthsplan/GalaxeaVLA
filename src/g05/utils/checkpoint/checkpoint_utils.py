@@ -890,3 +890,63 @@ def fix_optimizer_state_after_resume(optimizer) -> int:
                 reset_count += 1
                 optimizer.state[p] = {}
     return reset_count
+
+
+def save_best_checkpoint(output_dir, step: int, epoch: int, model, metric_name: str, metric_value: float):
+    """Inference-only checkpoint of the best eval metric so far -> ``output_dir/checkpoints/best.pt``
+    (written to best.pt.tmp first, then renamed) plus ``checkpoints/best_metric.json``.
+
+    LoRA runs are saved merged like ``save_training_checkpoint``; the raw adapters are kept so
+    the file can still seed a LoRA run. No optimizer/scheduler state: use step_N.pt to resume.
+    """
+    import json
+    from pathlib import Path
+
+    from g05.models.g05.lora import adapter_state_dict, export_state_dict, has_lora
+
+    output_dir = Path(output_dir)
+    ckdir = output_dir / "checkpoints"
+    ckdir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "step": step,
+        "epoch": epoch,
+        "batch_idx": 0,
+        "model_state_dict": export_state_dict(model),
+        "optimizer_state_dict": None,
+        "scheduler_state_dict": None,
+        "ema_model_state_dict": None,
+        "best_metric": {"name": metric_name, "value": float(metric_value), "step": step},
+    }
+    if has_lora(model):
+        state["lora_state_dict"] = adapter_state_dict(model)
+    tmp = ckdir / "best.pt.tmp"
+    torch.save(state, tmp)
+    tmp.replace(ckdir / "best.pt")
+    (ckdir / "best_metric.json").write_text(
+        json.dumps({"name": metric_name, "value": float(metric_value), "step": step}, indent=2))
+    return ckdir / "best.pt"
+
+
+def resume_best_metric(cfg) -> float:
+    """Best metric value recorded by a previous run of the same output dir (for ``resume_ckpt``),
+    else -inf so the first eval becomes the best."""
+    import json
+    from pathlib import Path
+
+    try:
+        out = Path(str(cfg.output_dir)) if getattr(cfg, "output_dir", None) else None
+    except Exception:
+        out = None
+    if out is None:
+        try:
+            from hydra.core.hydra_config import HydraConfig
+            out = Path(HydraConfig.get().runtime.output_dir)
+        except Exception:
+            return float("-inf")
+    p = out / "checkpoints" / "best_metric.json"
+    if getattr(cfg, "resume_ckpt", None) and p.exists():
+        try:
+            return float(json.loads(p.read_text())["value"])
+        except Exception:
+            return float("-inf")
+    return float("-inf")

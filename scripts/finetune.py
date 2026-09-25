@@ -61,6 +61,8 @@ from g05.utils.logging.log_box import log_box
 from g05.utils.config.config_resolvers import register_default_resolvers
 from g05.utils.checkpoint.ckpt_utils import copy_hf_processor_files
 from g05.utils.checkpoint.checkpoint_utils import (
+    save_best_checkpoint,
+    resume_best_metric,
     fix_optimizer_state_after_resume,
     save_training_checkpoint,
 )
@@ -1126,6 +1128,7 @@ def finetune(cfg: DictConfig):
     # Train!
     logger.info("Starting training...")
     training_done = False
+    best_metric_value = float(resume_best_metric(cfg))
     with tqdm.tqdm(initial=step, total=max_steps, leave=False, dynamic_ncols=True) as progress:
         latest_action_eval_batch = None
         _period_train_start = time.time()
@@ -1290,6 +1293,18 @@ def finetune(cfg: DictConfig):
                             )
                             _eval_time = eval_log_dict.pop("_eval_time_sec", 0.0)
                             log_dict.update(eval_log_dict)
+                            # Best-metric checkpoint (inference-only) whenever the tracked eval metric
+                            # improves; the metric name comes from cfg.best_metric (default: AR action
+                            # accuracy of the rollout eval). Written atomically to checkpoints/best.pt.
+                            _best_key = getattr(cfg, "best_metric", "eval/action/rollout/ar_action_acc")
+                            _cur = eval_log_dict.get(_best_key)
+                            if _cur is not None and not _dry_run and float(_cur) > best_metric_value:
+                                best_metric_value = float(_cur)
+                                if accelerator.is_main_process:
+                                    logger.info(f"New best {_best_key}={best_metric_value:.4f} at step {step}: saving checkpoints/best.pt")
+                                    save_best_checkpoint(output_dir, step=step, epoch=epoch, model=unwrap_model(model),
+                                                         metric_name=_best_key, metric_value=best_metric_value)
+                                accelerator.wait_for_everyone()
                             _total_time = _train_time_in_period + _eval_time
                             if _total_time > 0:
                                 log_dict["performance/train_eval_time_ratio"] = (
