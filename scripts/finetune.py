@@ -174,6 +174,15 @@ def _apply_dataset_override_if_needed(cfg: DictConfig) -> None:
     logger.info(f"[Data Override] processors: {list(dataset_config.get('processors', {}).keys())}")
 
 
+def _hydra_task_name():
+    try:
+        from hydra.core.hydra_config import HydraConfig
+
+        return HydraConfig.get().runtime.choices.get("task")
+    except Exception:
+        return None
+
+
 def unwrap_model(model):
     """Unwrap model from the DDP wrapper to access the underlying module."""
     if hasattr(model, "module"):
@@ -517,6 +526,25 @@ def finetune(cfg: DictConfig):
                 f"Updated tokenizer checkpoint path to {cfg.model.tokenizer.vq_config.ckpt_dir}"
             )
 
+    # Correlated FM noise: keep the factor with the run so serving picks it up automatically
+    # (ckpt_utils._apply_correlated_noise_sidecar); the checkpoint itself does not carry it.
+    _fm_cfg = cfg.model.model_arch.get("fm", None)
+    if (
+        not _dry_run
+        and _fm_cfg is not None
+        and _fm_cfg.get("use_correlated_noise", False)
+        and _fm_cfg.get("action_correlation_cholesky_path", None)
+    ):
+        _src_factor = Path(_fm_cfg.action_correlation_cholesky_path)
+        _dst_factor = output_dir / "action_correlation_factor.npy"
+        if accelerator.is_main_process:
+            _dst_factor.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(_src_factor, _dst_factor)
+            if _src_factor.with_suffix(".json").exists():
+                shutil.copy2(_src_factor.with_suffix(".json"), _dst_factor.with_suffix(".json"))
+            logger.info(f"Copied correlated-noise factor {_src_factor} -> {_dst_factor}")
+        accelerator.wait_for_everyone()
+
     # Copy HF processor/tokenizer config files to output_dir/hf_processor/ so eval/serve
     # can run without access to the original pretrained_model_path.
     if not _dry_run and accelerator.is_main_process:
@@ -555,67 +583,73 @@ def finetune(cfg: DictConfig):
             ],
         )
 
-    # assert not cfg.resume_ckpt and cfg.pretrained_ckpt
+    # An estimation job (estimate_action_cov) only reads the DataLoader: no model is built.
+    est_path = cfg.get("estimate_action_cov", None)
     checkpoint = None
-    if cfg.resume_ckpt or cfg.model.pretrained_ckpt:
-        ckpt_path = cfg.resume_ckpt if cfg.resume_ckpt else cfg.model.pretrained_ckpt
-        logger.info(f"Loading checkpoint from {ckpt_path}")
-        from g05.utils.checkpoint.checkpoint_utils import load_model_from_checkpoint
+    model = None
+    use_ema = False
+    if not est_path:
+        # assert not cfg.resume_ckpt and cfg.pretrained_ckpt
+        checkpoint = None
+        if cfg.resume_ckpt or cfg.model.pretrained_ckpt:
+            ckpt_path = cfg.resume_ckpt if cfg.resume_ckpt else cfg.model.pretrained_ckpt
+            logger.info(f"Loading checkpoint from {ckpt_path}")
+            from g05.utils.checkpoint.checkpoint_utils import load_model_from_checkpoint
 
-        model, checkpoint = load_model_from_checkpoint(
-            cfg.model.model_arch,
-            ckpt_path,
-            extra_prefixes=["normalizer."],
-            eval_mode=False,
-            return_full_checkpoint=True,
-        )
-    else:
-        model: BasePolicy = instantiate(cfg.model.model_arch)
-    if cfg.model.get("force_reinit_extra_token_embedding", False):
-        at = model.action_tokenizer
-        if at.use_extra_tokens:
-            model.model.resize_embedding(
-                new_vocab_size=len(at.tokenizer),
-                base_vocab_size=model._base_vocab_size,
-                pad_token_id=model.model_config.pad_token_id,
-                force=True,
+            model, checkpoint = load_model_from_checkpoint(
+                cfg.model.model_arch,
+                ckpt_path,
+                extra_prefixes=["normalizer."],
+                eval_mode=False,
+                return_full_checkpoint=True,
             )
+        else:
+            model: BasePolicy = instantiate(cfg.model.model_arch)
+        if cfg.model.get("force_reinit_extra_token_embedding", False):
+            at = model.action_tokenizer
+            if at.use_extra_tokens:
+                model.model.resize_embedding(
+                    new_vocab_size=len(at.tokenizer),
+                    base_vocab_size=model._base_vocab_size,
+                    pad_token_id=model.model_config.pad_token_id,
+                    force=True,
+                )
 
-    if cfg.model.model_weights_to_bf16:
-        model = model.to(torch.bfloat16)
+        if cfg.model.model_weights_to_bf16:
+            model = model.to(torch.bfloat16)
 
-    # Force critical layers to float32 (patterns defined per-model in fp32_param_patterns)
-    model.apply_fp32_params()
+        # Force critical layers to float32 (patterns defined per-model in fp32_param_patterns)
+        model.apply_fp32_params()
 
-    # LoRA: inject adapters into the loaded weights and freeze the rest. Before EMA /
-    # DDP / optimizer, which all capture the parameter set (see g05/models/g05/lora.py).
-    lora_cfg = cfg.model.get("lora", None)
-    lora_grads_unchecked = bool(lora_cfg is not None and lora_cfg.get("enabled", False))
-    if lora_grads_unchecked:
-        from g05.models.g05.lora import apply_lora, check_adapter_grads, summarize_trainable
+        # LoRA: inject adapters into the loaded weights and freeze the rest. Before EMA /
+        # DDP / optimizer, which all capture the parameter set (see g05/models/g05/lora.py).
+        lora_cfg = cfg.model.get("lora", None)
+        lora_grads_unchecked = bool(lora_cfg is not None and lora_cfg.get("enabled", False))
+        if lora_grads_unchecked:
+            from g05.models.g05.lora import apply_lora, check_adapter_grads, summarize_trainable
 
-        apply_lora(model, lora_cfg, resume_checkpoint=checkpoint if cfg.resume_ckpt else None)
-        for line in summarize_trainable(model):
-            logger.info(f"  trainable {line}")
+            apply_lora(model, lora_cfg, resume_checkpoint=checkpoint if cfg.resume_ckpt else None)
+            for line in summarize_trainable(model):
+                logger.info(f"  trainable {line}")
 
-    use_ema = cfg.model.use_ema
-    if use_ema:
-        ema_model = EMA(
-            model,
-            update_after_step=cfg.model.ema.update_after_step,
-            beta=cfg.model.ema.power,
-        ).to(device_id)
+        use_ema = cfg.model.use_ema
+        if use_ema:
+            ema_model = EMA(
+                model,
+                update_after_step=cfg.model.ema.update_after_step,
+                beta=cfg.model.ema.power,
+            ).to(device_id)
 
-    if cfg.model.use_sync_bn and accelerator.num_processes > 1:
-        logger.info("Use sync batch norm.")
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        if cfg.model.use_sync_bn and accelerator.num_processes > 1:
+            logger.info("Use sync batch norm.")
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    if cfg.model.use_torch_compile:
-        model = torch.compile(model, mode="default")
+        if cfg.model.use_torch_compile:
+            model = torch.compile(model, mode="default")
 
-    model = model.to(device_id)
-    if hasattr(model, "action_tokenizer"):
-        model.action_tokenizer.to(device_id)
+        model = model.to(device_id)
+        if hasattr(model, "action_tokenizer"):
+            model.action_tokenizer.to(device_id)
 
     with accelerator.main_process_first():
         logger.info(f"[Process {accelerator.process_index}] Loading dataset...")
@@ -843,6 +877,49 @@ def finetune(cfg: DictConfig):
         collate_fn=action_collate_fn,
         prefetch_factor=dl_prefetch_factor,
     )
+
+    # ---- Action second moment for correlated FM noise (fm_helper / action_covariance.py) ----
+    # `estimate_action_cov=<out.npy>` turns this run into an estimation job: it reads action
+    # chunks from the real training DataLoader (same normalization / layout / horizon the FM
+    # head sees), writes the factor FMHelper._load_cholesky expects, and exits.
+    if est_path:
+        if accelerator.is_main_process:
+            from g05.models.g05.helpers.action_covariance import (
+                estimate_from_dataloader,
+                save_factor,
+            )
+
+            # Images are decoded although only actions are used: the processor requires the
+            # camera keys to build a sample (turning image loading off makes every sample fail).
+            fm_cfg = cfg.model.model_arch.fm
+            embodiments = list(fm_cfg.get("correlated_noise_embodiments", None) or [])
+            n_target = int(cfg.get("estimate_action_cov_samples", 20000))
+            horizon, action_dim = int(fm_cfg.horizon_steps), int(fm_cfg.action_dim)
+            logger.info(
+                f"[action cov] estimating E[vec(a)vec(a)^T] over {n_target} chunks "
+                f"(H={horizon}, D={action_dim}, embodiments={embodiments or 'all'}) -> {est_path}"
+            )
+            acc = estimate_from_dataloader(
+                train_dataloader, horizon, action_dim, n_target, embodiments=embodiments
+            )
+            summary = save_factor(
+                acc.sigma(),
+                est_path,
+                {
+                    "samples": acc.count,
+                    "skipped_padded_chunks": acc.skipped_padded,
+                    "skipped_other_embodiment": acc.skipped_embodiment,
+                    "horizon": horizon,
+                    "action_dim": action_dim,
+                    "embodiments": embodiments,
+                    "task_config": _hydra_task_name(),
+                    "datastatics_path": cfg.get("datastatics_path", None),
+                },
+            )
+            logger.info(f"[action cov] saved: {json.dumps(summary)}")
+        accelerator.wait_for_everyone()
+        accelerator.end_training()
+        return
 
     evaluator = PeriodicEvaluator(
         eval_dataloader=eval_dataloader,

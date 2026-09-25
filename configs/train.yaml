@@ -13,6 +13,10 @@ seed: 7
 
 use_fused_optimizer: False # fused=True for AdamW: single fused CUDA kernel for optimizer step
 resume_ckpt: null
+# Set to an output .npy to run the correlated-noise covariance estimation instead of training
+# (scripts/finetune.py, models/g05/helpers/action_covariance.py).
+estimate_action_cov: null
+estimate_action_cov_samples: 20000
 exp_name: "${oc.env:EXP_NAME, ${now:%Y-%m-%d_%H-%M-%S}}"
 output_dir: ${hydra:runtime.output_dir}
 

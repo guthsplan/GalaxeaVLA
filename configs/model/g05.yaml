@@ -191,6 +191,13 @@ model_arch:
     num_inference_steps: 10
     num_flow_samples: 1
     fm_weight: 1.0
+    # Correlated noise (arXiv:2512.06951 Sec. 5): eps ~ N(0, beta*Sigma + (1-beta)*I) instead
+    # of N(0, I), in training AND as the ODE start at inference. Sigma comes from
+    # `estimate_action_cov=<path>` (scripts/finetune.py); only listed embodiments use it.
+    use_correlated_noise: false
+    correlation_beta: 0.5
+    correlated_noise_embodiments: []
+    action_correlation_cholesky_path: null
     joint_training: false
     padding_action_weight: 0.0
     zero_pad_action_target: false
