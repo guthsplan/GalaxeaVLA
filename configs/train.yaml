@@ -21,6 +21,7 @@ checkpointing_steps: 2000
 
 # eval
 eval_steps: 100
+eval_num_batches: 1   # validation batches averaged per periodic eval (each rank draws its own)
 
 # logger configuration - supports swanlab, wandb, or none
 logger:

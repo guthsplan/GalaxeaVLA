@@ -852,6 +852,7 @@ def finetune(cfg: DictConfig):
         eval_processor=eval_processor,
         parts_meta=eval_parts_meta,
         output_dir=output_dir,
+        num_batches=int(cfg.get("eval_num_batches", 1)),
     )
 
     if overfit_batch is not None:
