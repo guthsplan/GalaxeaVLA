@@ -161,6 +161,9 @@ embodiment_datasets:
     lerobot_ds_version: '3.0'
     shape_meta: *behavior_shape_meta
     stats_downsample_rate: 10
+    # Training split only: one sample per N consecutive frames (random frame within each window),
+    # so an epoch is N x shorter. 30 Hz demos make neighbouring frames near-duplicates.
+    train_frame_stride: 1
     dataset_groups:
     - weight: 1.0
       dataset_dirs:

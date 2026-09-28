@@ -105,9 +105,14 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         override_fps: Optional[int] = None,
         load_images: Optional[bool] = None,
         in_memory: bool = False,
+        # training-set frame subsampling: one sample per `train_frame_stride` consecutive frames
+        train_frame_stride: int = 1,
         **kwargs,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
+        assert int(train_frame_stride) >= 1, f"train_frame_stride must be >= 1, got {train_frame_stride}"
+        # Only the training split is subsampled; the validation split keeps every frame.
+        self.train_frame_stride = int(train_frame_stride) if is_training_set else 1
         assert past_action_size == 0
 
         self.dataset_dirs = dataset_dirs
@@ -796,7 +801,20 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
     def __len__(self):
         if hasattr(self, "_overfit_len"):
             return self._overfit_len
-        return self._end_idx - self._start_idx
+        n = self._end_idx - self._start_idx
+        stride = getattr(self, "train_frame_stride", 1)
+        return -(-n // stride) if stride > 1 else n
+
+    def _strided_sample_idx(self, idx: int) -> int:
+        """Frame for strided sample `idx`: a uniformly random frame of window [idx*s, idx*s + s).
+
+        30 Hz demos make neighbouring frames near-duplicates; the jitter keeps every frame
+        reachable across epochs while one epoch is `s` times shorter.
+        """
+        stride = self.train_frame_stride
+        lo = self._start_idx + idx * stride
+        width = min(stride, self._end_idx - lo)
+        return lo + int(np.random.randint(width))
 
     def _locate_sample(self, sample_idx: int) -> str:
         """Map a global sample index back to its dataset directory and local index (O(log N) bisect)."""
@@ -863,6 +881,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         overfit_active = hasattr(self, "_overfit_indices")
         if overfit_active:
             sample_idx = int(self._overfit_indices[idx])
+        elif getattr(self, "train_frame_stride", 1) > 1:
+            sample_idx = self._strided_sample_idx(idx)
         else:
             sample_idx = idx + self._start_idx
         attempt = 0
