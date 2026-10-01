@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from g05.data.skill_balance import SkillBalancedIndex, parse_skill_weights
 from g05.data_processor.processor.base_processor import BaseProcessor
 from g05.utils.logging.logging_config import get_logger
 
@@ -107,6 +108,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         in_memory: bool = False,
         # training-set frame subsampling: one sample per `train_frame_stride` consecutive frames
         train_frame_stride: int = 1,
+        # training-set skill-balanced sampling (BEHAVIOR skill annotations, see g05.data.skill_balance):
+        # skill mass ∝ frames ** skill_balance_alpha * skill_weights[skill]; 1.0 / {} = off
+        skill_balance_alpha: float = 1.0,
+        skill_weights: Union[None, str, Dict[str, float]] = None,
+        skill_annotation_root: Optional[str] = None,
         **kwargs,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
@@ -303,6 +309,21 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         else:
             self._start_idx = 0
             self._end_idx = self.multi_dataset.num_frames
+
+        self._skill_index = None
+        skill_weights = parse_skill_weights(_to_plain(skill_weights))
+        if self.is_training_set and (float(skill_balance_alpha) != 1.0 or skill_weights):
+            self._skill_index = SkillBalancedIndex(
+                datasets=self.multi_dataset._datasets,
+                episode_from=self.episode_data_index["from"].tolist(),
+                episode_to=self.episode_data_index["to"].tolist(),
+                start_idx=self._start_idx,
+                end_idx=self._end_idx,
+                num_samples=len(self),
+                alpha=float(skill_balance_alpha),
+                skill_weights=skill_weights,
+                annotation_root=skill_annotation_root,
+            )
 
     def _setup_meta_lerobot_keys(self):
         """Configs must provide the explicit raw layout for every meta."""
@@ -881,6 +902,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         overfit_active = hasattr(self, "_overfit_indices")
         if overfit_active:
             sample_idx = int(self._overfit_indices[idx])
+        elif getattr(self, "_skill_index", None) is not None:
+            sample_idx = self._skill_index(idx)
         elif getattr(self, "train_frame_stride", 1) > 1:
             sample_idx = self._strided_sample_idx(idx)
         else:
