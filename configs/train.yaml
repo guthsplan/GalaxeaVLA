@@ -22,6 +22,8 @@ checkpointing_steps: 2000
 # eval
 eval_steps: 100
 eval_num_batches: 1   # validation batches averaged per periodic eval (each rank draws its own)
+best_metric: eval/action/rollout/ar_action_acc   # eval metric that selects checkpoints/best.pt
+best_metric_mode: max   # max: higher is better (accuracy); min: lower is better (e.g. eval/action/rollout/fm_action_l1)
 
 # logger configuration - supports swanlab, wandb, or none
 logger:

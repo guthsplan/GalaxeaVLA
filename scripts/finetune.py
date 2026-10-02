@@ -1129,7 +1129,11 @@ def finetune(cfg: DictConfig):
     # Train!
     logger.info("Starting training...")
     training_done = False
+    # cfg.best_metric_mode: "max" (default; e.g. ar_action_acc) or "min" (e.g. fm_action_l1, lower is better)
+    _best_min = str(getattr(cfg, "best_metric_mode", "max")).lower() == "min"
     best_metric_value = float(resume_best_metric(cfg))
+    if _best_min and best_metric_value == float("-inf"):
+        best_metric_value = float("inf")
     with tqdm.tqdm(initial=step, total=max_steps, leave=False, dynamic_ncols=True) as progress:
         latest_action_eval_batch = None
         _period_train_start = time.time()
@@ -1296,10 +1300,13 @@ def finetune(cfg: DictConfig):
                             log_dict.update(eval_log_dict)
                             # Best-metric checkpoint (inference-only) whenever the tracked eval metric
                             # improves; the metric name comes from cfg.best_metric (default: AR action
-                            # accuracy of the rollout eval). Written atomically to checkpoints/best.pt.
+                            # accuracy of the rollout eval) and the direction from cfg.best_metric_mode.
+                            # Written atomically to checkpoints/best.pt.
                             _best_key = getattr(cfg, "best_metric", "eval/action/rollout/ar_action_acc")
                             _cur = eval_log_dict.get(_best_key)
-                            if _cur is not None and not _dry_run and float(_cur) > best_metric_value:
+                            _improved = _cur is not None and _cur >= 0 and (
+                                float(_cur) < best_metric_value if _best_min else float(_cur) > best_metric_value)
+                            if _improved and not _dry_run:
                                 best_metric_value = float(_cur)
                                 if accelerator.is_main_process:
                                     logger.info(f"New best {_best_key}={best_metric_value:.4f} at step {step}: saving checkpoints/best.pt")

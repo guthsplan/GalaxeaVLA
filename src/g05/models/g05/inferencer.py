@@ -117,6 +117,12 @@ class PolicyInferencer:
         sub_processor = resolve_processor(self.processor, obs_dict)
         sample = sub_processor.preprocess(obs_dict)
 
+        # FM prefix inpainting: obs_dict["action"][:d] carries absolute actions to pin; the
+        # processor has just re-referenced them to the current state and normalized them.
+        n_pre = int(obs_dict.get("fm_prefix_steps", 0) or 0)
+        if n_pre > 0 and "action" in sample and isinstance(sample.get("samples"), dict):
+            sample["samples"]["fm_prefix"] = sample["action"][:n_pre].clone().float()
+
         sample.pop("action", None)
         sample.pop("action_is_pad", None)
         sample.pop("gt_action", None)

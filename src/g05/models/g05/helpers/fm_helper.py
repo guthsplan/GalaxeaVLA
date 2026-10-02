@@ -15,7 +15,7 @@ import logging
 
 import torch
 import torch.distributions as dist
-from typing import Dict
+from typing import Dict, Optional
 from g05.models.kv_cache import SparseKVCache
 
 logger = logging.getLogger(__name__)
@@ -383,9 +383,15 @@ class FMHelper:
         action_dim_is_pad=None,
         position_ids_override=None,
         embodiment_types: list = None,
+        prefix: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """FM inference: Euler integration. Caller owns prefill.
+
+        prefix: optional [B, d, D] normalized actions that pin the first d chunk steps
+            (inference-time inpainting): before every Euler step x[:, :d] is replaced by the
+            forward-process point of the prefix at the current t, and after the loop by the
+            prefix itself, so the generated tail is conditioned on it.
 
         Args:
             model: G05Model instance
@@ -419,6 +425,11 @@ class FMHelper:
         if _pad_mask is not None:
             action.masked_fill_(_pad_mask, 0.0)
 
+        if prefix is not None:
+            prefix = prefix.to(device=device, dtype=action.dtype)
+            n_pre = prefix.size(1)
+            eps_pre = action[:, :n_pre].clone()  # fixed noise for the pinned steps
+
         # Build action mask + position_ids
         action_mask, action_pos = model.build_action_mask_and_position_ids(
             attention_mask,
@@ -444,6 +455,10 @@ class FMHelper:
             t = torch.zeros(bsz, device=device, dtype=dtype)
 
         for _ in range(self.num_inference_steps):
+            if prefix is not None:
+                # psi_t of the prefix: pi convention t=1 is noise, otherwise t=0 is noise
+                tn = (t if self.time_convention == "pi_convention" else 1.0 - t).view(-1, 1, 1)
+                action[:, :n_pre] = (1.0 - tn) * prefix + tn * eps_pre
             with torch.autocast(device.type, enabled=False):
                 action_embeds = model.action_expert.embed(action.float())
                 time_cond = model.action_expert.encode_time(t)
@@ -467,6 +482,11 @@ class FMHelper:
                 action += delta_t * action_vel
                 t += delta_t
 
+            if _pad_mask is not None:
+                action.masked_fill_(_pad_mask, 0.0)
+
+        if prefix is not None:
+            action[:, :n_pre] = prefix
             if _pad_mask is not None:
                 action.masked_fill_(_pad_mask, 0.0)
 

@@ -815,6 +815,7 @@ class G05Policy(BasePolicy):
         *,
         max_new_tokens: Optional[int] = None,
         stop_token_ids: Optional[List[int]] = None,
+        forced_ids: Optional[torch.Tensor] = None,
         trim_token_ids: Optional[List[int]] = None,
         return_updated_state: bool = True,
         **ar_kwargs,
@@ -843,6 +844,7 @@ class G05Policy(BasePolicy):
             return_kv_cache=return_updated_state,
             stop_token_ids=stop_token_ids,
             max_new_tokens=max_new_tokens,
+            forced_ids=forced_ids,
             **ar_kwargs,
         )
         generated_ids = ar_output["generated_ids"]
@@ -895,6 +897,11 @@ class G05Policy(BasePolicy):
             t_fm0 = time.monotonic()
             # Tells the inferencer that ar_absent_keys do not describe the executed action.
             results["action_source"] = "fm"
+            # Inference-time prefix inpainting: the serving wrapper passes the previous chunk's
+            # unexecuted steps (re-normalized against the current state) as samples[i]["fm_prefix"].
+            fm_kwargs = {}
+            if samples and all(isinstance(s, dict) and s.get("fm_prefix") is not None for s in samples):
+                fm_kwargs["prefix"] = torch.stack([s["fm_prefix"] for s in samples])
             results["action"] = self.model.inference_fm(
                 attention_mask=state.attention_mask,
                 pixel_values=state.pixel_values,
@@ -902,6 +909,7 @@ class G05Policy(BasePolicy):
                 action_dim_is_pad=action_dim_is_pad,
                 position_ids_override=state.position_ids,
                 embodiment_types=[s.get("embodiment") for s in samples],
+                **fm_kwargs,
             )
             _sync_if_cuda_available()
             timing["fm_action_ms"] = (time.monotonic() - t_fm0) * 1000.0
@@ -1031,10 +1039,21 @@ class G05Policy(BasePolicy):
         if self.predict_cot:
             eov_id = self.model.ar_helper.eov_token_id
             t0 = time.monotonic()
+            # sample["forced_cot"]: teacher-force this CoT text instead of the model's own, so the
+            # action stage is conditioned on it (used by the serving-side subtask filter).
+            forced_ids = None
+            forced_txt = samples[0].get("forced_cot") if samples else None
+            if forced_txt:
+                ids = self.processor.tokenizer.encode(str(forced_txt), add_special_tokens=False)
+                if eov_id is not None:
+                    ids = list(ids) + [eov_id]
+                forced_ids = torch.tensor([ids], dtype=torch.long,
+                                          device=state.attention_mask.device).repeat(len(samples), 1)
             state = self.generate_text(
                 state,
                 stop_token_ids=[eov_id] if eov_id is not None else None,
                 trim_token_ids=self._get_trim_token_ids(include_eov=True),
+                forced_ids=forced_ids,
             )
             _sync_if_cuda_available()
             timing["cot_generate_text_ms"] = (time.monotonic() - t0) * 1000.0
