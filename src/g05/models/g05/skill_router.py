@@ -11,7 +11,7 @@ frozen and only action-expert adapters (+ small action-expert modules) trained
 Expert file (tools/export_skill_expert.py), ``torch.save`` of::
 
     format      "g05_skill_expert_v1"
-    groups      ["grasp"] | ["revolute", "linear"] | ["all"]   (all = fallback for every group)
+    groups      ["grasp"] | ["push_contact", "tool"] | ["all"]   (all = fallback for every group)
     lora        {"<module>": {"A": [r, in], "B": [out, r] (already x alpha / r)}}
     full        {"<param>": tensor}   action-expert params trained in full (I/O projections, ...)
     base_fingerprint {"<param>": float}   sums of base weights, to catch a wrong base checkpoint

@@ -54,7 +54,7 @@ def test_switching_adds_the_adapter_and_swaps_full_params(tmp_path):
     base_q = _q0_out(model, x).detach().clone()
     base_out = model.action_expert.output_proj.weight.detach().clone()
     p_grasp, e_grasp = _expert(tmp_path, model, ["grasp"], 1)
-    p_place, e_place = _expert(tmp_path, model, ["place", "revolute"], 2)
+    p_place, e_place = _expert(tmp_path, model, ["place", "push_contact"], 2)
     router = SkillExpertRouter(model, [str(p_grasp), str(p_place)])
 
     r = router.route("Subtask: pick up cup_1 from table_2|Action: ")
@@ -63,8 +63,8 @@ def test_switching_adds_the_adapter_and_swaps_full_params(tmp_path):
     torch.testing.assert_close(_q0_out(model, x), base_q + x @ a.t() @ b.t())
     torch.testing.assert_close(model.action_expert.output_proj.weight, e_grasp["full"]["action_expert.output_proj.weight"])
 
-    r = router.route("Subtask: open door fridge_0")
-    assert r["expert"] == "place+revolute" and r["group"] == "revolute"
+    r = router.route("Subtask: close door fridge_0")
+    assert r["expert"] == "place+push_contact" and r["group"] == "push_contact"
     a, b = e_place["lora"][Q0]["A"], e_place["lora"][Q0]["B"]
     torch.testing.assert_close(_q0_out(model, x), base_q + x @ a.t() @ b.t())
 
@@ -75,7 +75,7 @@ def test_switching_adds_the_adapter_and_swaps_full_params(tmp_path):
     torch.testing.assert_close(model.action_expert.output_proj.weight, base_out)
 
     # many switches leave the base weights untouched
-    for t in ["pick up a from b", "open door c", "move to d"] * 5:
+    for t in ["pick up a from b", "close door c", "move to d"] * 5:
         router.route(t)
     torch.testing.assert_close(_q0_out(model, x), base_q)
     router.remove()

@@ -62,4 +62,4 @@ model:
 data:
   embodiment_datasets:
     behavior_r1pro:
-      skill_groups: null   # set per run, e.g. grasp | revolute,linear | all
+      skill_groups: null   # set per run, e.g. grasp | push_contact,tool | all

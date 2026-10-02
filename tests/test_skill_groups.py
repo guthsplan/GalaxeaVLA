@@ -12,9 +12,17 @@ def test_groups_partition_the_35_challenge_skills():
     assert len(skills) == len(set(skills)) == len(ALL_SKILLS) == 35
 
 
+def test_open_and_close_split_by_gripper():
+    # opening grasps the handle, closing pushes it shut
+    for obj in ("door", "drawer", "lid"):
+        assert SKILL_TO_GROUP[f"open {obj}"] == "grasp"
+        assert SKILL_TO_GROUP[f"close {obj}"] == "push_contact"
+    assert SKILL_TO_GROUP["turn to"] == "push_contact"   # turns an object, not the base
+
+
 def test_parse_groups():
     assert parse_groups("grasp, place") == ["grasp", "place"]
-    assert parse_groups(["revolute", "revolute"]) == ["revolute"]
+    assert parse_groups(["tool", "tool"]) == ["tool"]
     assert parse_groups("all") == [ALL]
     assert parse_groups(None) == []
     with pytest.raises(ValueError):
@@ -22,11 +30,11 @@ def test_parse_groups():
     with pytest.raises(ValueError):
         parse_groups("all,grasp")
     assert skills_of(["all"]) == list(ALL_SKILLS)
-    assert skills_of("revolute") == ["open door", "close door", "open lid", "close lid"]
+    assert skills_of("push_contact") == ["push to", "push tray", "close door", "close lid", "close drawer", "turn to"]
 
 
 def test_skill_weights_for_groups_drop_unknown_labels():
-    w = skill_weights_for_groups(["press"], ["press", "move to", "<unannotated>"])
+    w = skill_weights_for_groups(["inplace"], ["press", "move to", "<unannotated>"])
     assert w["press"] == 1.0 and w["move to"] == 0.0 and w["<unannotated>"] == 0.0
 
 

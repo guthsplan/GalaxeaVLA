@@ -1,16 +1,24 @@
 """BEHAVIOR skill groups for skill-specific action experts.
 
 The 35 skills of the 2026 challenge skill annotations (`skill_description`), grouped by the
-motion primitive the action expert has to produce (which body part moves and how), not by
-meaning. Frame shares are over the 20k challenge demos.
+motion the action expert has to produce, not by meaning. The main axis is the gripper: whether
+the segment closes it, opens it or never switches it (the most abrupt part of an action chunk),
+then whether the base or the arms drive the motion. Frame shares are over the 20k challenge
+demos; motion figures are medians over 38k segments of 64 tasks (gripper switches per segment
+on average).
 
-    navigation    38.7%  base motion, arms mostly still
-    grasp         24.0%  approach + close the gripper
-    place         17.6%  carry + open the gripper at a target
-    revolute      10.0%  grasp a handle and follow an arc (doors, lids)
-    linear         5.6%  straight push / pull (drawers, trays, pushing objects)
-    tool_contact   3.0%  repetitive or rotating contact with a held tool
-    press          1.1%  short point contact (switches, buttons)
+    navigation    38.4%  base drives (moving 91% of the time), arms still, no gripper switch
+    grasp         30.3%  approach and close the gripper on an object or a handle (1.1 switches)
+    place         17.0%  carry and open the gripper at a target (1.0 switches)
+    push_contact   9.0%  push / close without the gripper (0.0 switches), long (17 s)
+    tool           3.1%  held-tool strokes without a gripper switch, short (6 s), one arm
+    inplace        2.1%  base fully still (2.5%), several gripper switches (1.7), short (8 s):
+                         switches, buttons, hand-overs, insert / attach
+
+Opening and closing the same articulated object land in different groups on purpose: opening
+grasps the handle (open door 1.6 switches, open drawer 2.0, open lid 1.0) while closing pushes it
+shut (0.0). "turn to" turns an object toward a target ("turn food_processor_90 to robot") with
+the arms; it is not base navigation.
 
 Used on both sides of a skill-expert run:
   * training: `skill_groups` on the dataset keeps only the frames whose annotated skill is in
@@ -26,16 +34,15 @@ import re
 from typing import Dict, Iterable, List, Optional, Sequence, Union
 
 SKILL_GROUPS: Dict[str, tuple] = {
-    "navigation": ("move to", "turn to"),
-    "grasp": ("pick up from", "lift", "hold", "hand over"),
-    "place": (
-        "place in", "place on", "place on next to", "place in next to", "place under",
-        "hang", "release", "insert", "attach",
+    "navigation": ("move to",),
+    "grasp": ("pick up from", "lift", "open door", "open drawer", "open lid", "pull tray", "tip over"),
+    "place": ("place in", "place on", "place on next to", "place in next to", "place under", "hang"),
+    "push_contact": ("push to", "push tray", "close door", "close lid", "close drawer", "turn to"),
+    "tool": ("chop", "sweep surface", "sweep off", "pour", "wipe hard", "spray"),
+    "inplace": (
+        "turn on switch", "turn off switch", "press", "ignite",
+        "hand over", "insert", "hold", "release", "attach",
     ),
-    "revolute": ("open door", "close door", "open lid", "close lid"),
-    "linear": ("push to", "open drawer", "close drawer", "pull tray", "push tray", "tip over"),
-    "tool_contact": ("wipe hard", "sweep surface", "sweep off", "spray", "chop", "pour"),
-    "press": ("turn on switch", "turn off switch", "press", "ignite"),
 }
 
 #: Pseudo-group of an expert trained on every skill (the fallback expert at inference).
