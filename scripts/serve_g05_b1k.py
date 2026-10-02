@@ -101,8 +101,10 @@ def _to_chw(img: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
 
 
 class G05B1KPolicy:
-    def __init__(self, inferencer, processor, task_text: str, action_steps: int, image_hw: dict):
+    def __init__(self, inferencer, processor, task_text: str, action_steps: int, image_hw: dict,
+                 skill_router=None):
         self.task_text = task_text
+        self.skill_router = skill_router
         self.image_hw = image_hw
         self.wrapper = sp.ChunkedPolicyWrapper(inferencer, processor, action_steps=action_steps)
         self.n_calls = 0
@@ -112,6 +114,8 @@ class G05B1KPolicy:
 
     def reset(self):
         self.wrapper.reset()
+        if self.skill_router is not None:
+            self.skill_router.reset()
         logger.info(f"episode reset after {self.n_calls} steps / {self.n_infer} model calls; "
                     f"held (absent) parts: {dict(self.missing_counts)}")
         self.n_calls = 0
@@ -254,6 +258,11 @@ def main():
     ap.add_argument("--task-yaml", default=str(_HERE.parent / "configs" / "task" / "behavior.yaml"))
     ap.add_argument("--override", nargs="*", help="extra hydra key=value overrides")
     ap.add_argument("--selftest", action="store_true", help="run one inference on a synthetic obs and exit")
+    ap.add_argument("--skill-experts", nargs="*", default=None,
+                    help="skill-expert files (tools/export_skill_expert.py): the generated CoT subtask "
+                         "picks one per model call, and its action expert sees only the prompt context")
+    ap.add_argument("--skill-min-consecutive", type=int, default=1,
+                    help="switch skill group only after this many consecutive predictions of it")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -269,7 +278,14 @@ def main():
     p = sp.resolve_processor(processor, {"embodiment_type": EMBODIMENT})
     image_hw = {m["key"]: tuple(m["raw_shape"][1:]) for m in p.shape_meta["images"]}
     logger.info(f"image raw sizes: {image_hw}; action_horizon={getattr(p, 'action_horizon', None)}")
-    policy = G05B1KPolicy(inferencer, processor, task_text, args.action_steps, image_hw)
+    router = None
+    if args.skill_experts:
+        from g05.models.g05.skill_router import SkillExpertRouter
+
+        router = SkillExpertRouter(policy_model.model, args.skill_experts,
+                                   min_consecutive=args.skill_min_consecutive)
+        policy_model.attach_skill_router(router)
+    policy = G05B1KPolicy(inferencer, processor, task_text, args.action_steps, image_hw, skill_router=router)
 
     if args.selftest:
         rng = np.random.default_rng(0)
@@ -300,7 +316,7 @@ def main():
         return
 
     metadata = {"policy": "g05", "ckpt": str(args.ckpt_path), "task": args.task_name,
-                "action_steps": args.action_steps}
+                "action_steps": args.action_steps, "skill_experts": args.skill_experts or []}
     asyncio.run(serve(policy, args.host, args.port, metadata))
 
 

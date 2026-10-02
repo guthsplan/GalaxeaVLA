@@ -8,7 +8,8 @@ sampling mass of skill k is
 
 spread uniformly over that skill's frames. alpha = 1 with no weights is the natural
 frame distribution; alpha = 0 gives every skill the same mass; `weight_k` multiplies on top
-(e.g. "move to=0.3"). Frames outside every segment (leading frames before the first
+(e.g. "move to=0.3"). `keep_skills` zeroes every other skill (skill-expert runs, see
+g05.data.skill_groups). Frames outside every segment (leading frames before the first
 segment, gaps, a tail past the last one) take the nearest segment's skill.
 
 Sample `idx` of `n` is drawn by stratified inverse-CDF over the cumulative mass: mass
@@ -102,6 +103,7 @@ class SkillBalancedIndex:
         alpha: float = 1.0,
         skill_weights: Optional[Dict[str, float]] = None,
         annotation_root: Optional[str] = None,
+        keep_skills: Optional[Sequence[str]] = None,
     ):
         if alpha < 0:
             raise ValueError(f"skill_balance_alpha must be >= 0, got {alpha}")
@@ -156,6 +158,12 @@ class SkillBalancedIndex:
         if unknown:
             logger.warning(f"[skill-balance] skill_weights names absent from the training split: {unknown}")
         mult = np.asarray([skill_weights.get(s, 1.0) for s in skills], dtype=np.float64)
+        if keep_skills is not None:
+            # skill-expert runs (g05.data.skill_groups): every other skill gets no mass
+            keep = set(keep_skills)
+            if not keep & set(skills):
+                raise ValueError(f"none of the skills {sorted(keep)} occur in this split")
+            mult *= np.asarray([s in keep for s in skills], dtype=np.float64)
         mass = frames_per_skill ** alpha * mult
         if mass.sum() <= 0:
             raise ValueError("skill_weights zero out every skill")
@@ -179,7 +187,8 @@ class SkillBalancedIndex:
                 f"{mass[k] * 100:>10.2f}{mass[k] / share[k]:>7.2f}"
             )
         logger.info(
-            f"[skill-balance] alpha={alpha}, weights={skill_weights or {}}, {len(lo)} runs, "
+            f"[skill-balance] alpha={alpha}, weights={skill_weights or {}}, "
+            f"keep={sorted(keep_skills) if keep_skills is not None else 'all'}, {len(lo)} runs, "
             f"{self.num_samples} samples/epoch\n" + "\n".join(lines)
         )
         self.summary = {s: (int(f), float(m)) for s, f, m in zip(skills, frames_per_skill, mass)}

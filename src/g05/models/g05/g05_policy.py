@@ -59,6 +59,10 @@ class InferenceState:
     device: torch.device = None
     generated_texts: Optional[List[str]] = None
     generated_ids: Optional[torch.Tensor] = None
+    # Snapshot of the prefilled prompt context (skill-routed FM, see G05Policy._context_cache):
+    # attention_mask / position_ids / length at prefill time, and the GatedDeltaNet recurrent
+    # states before the CoT was generated.
+    context: Optional[Dict[str, Any]] = None
 
     def check_invariants(self, where: str = "") -> None:
         from .model.utils import kv_cache_seq_len
@@ -874,6 +878,7 @@ class G05Policy(BasePolicy):
         *,
         action_dim_is_pad: Optional[torch.BoolTensor] = None,
         action_gt: Optional[torch.Tensor] = None,
+        fm_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Stage 3: generate actions, using FM continuous and/or AR discrete paths.
 
@@ -884,6 +889,8 @@ class G05Policy(BasePolicy):
             samples: original samples; AR decode needs frequency/embodiment
             action_dim_is_pad: [B, D] bool mask
             action_gt: [B, H, D] GT action for action_evaluator
+            fm_context: {attention_mask, kv_cache, position_ids} the FM action expert conditions
+                on instead of the full state (skill-routed experts: the prompt context only)
         """
         state.check_invariants("generate_action entry")
         results: Dict[str, Any] = {}
@@ -895,12 +902,17 @@ class G05Policy(BasePolicy):
             t_fm0 = time.monotonic()
             # Tells the inferencer that ar_absent_keys do not describe the executed action.
             results["action_source"] = "fm"
+            fm_in = fm_context or {
+                "attention_mask": state.attention_mask,
+                "kv_cache": state.kv_cache,
+                "position_ids": state.position_ids,
+            }
             results["action"] = self.model.inference_fm(
-                attention_mask=state.attention_mask,
+                attention_mask=fm_in["attention_mask"],
                 pixel_values=state.pixel_values,
-                past_key_values=state.kv_cache,
+                past_key_values=fm_in["kv_cache"],
                 action_dim_is_pad=action_dim_is_pad,
-                position_ids_override=state.position_ids,
+                position_ids_override=fm_in["position_ids"],
                 embodiment_types=[s.get("embodiment") for s in samples],
             )
             _sync_if_cuda_available()
@@ -996,6 +1008,54 @@ class G05Policy(BasePolicy):
     # High-level inference entry point (composes the three stages)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Skill-routed action experts (g05/models/g05/skill_router.py)
+    # ------------------------------------------------------------------
+
+    def attach_skill_router(self, router) -> None:
+        """Route every forward_inference through `router` (a SkillExpertRouter of self.model)."""
+        if not (self.predict_cot and self.continuous_action):
+            raise ValueError(
+                "skill experts need a CoT policy with an FM action expert "
+                f"(predict_cot={self.predict_cot}, continuous_action={self.continuous_action})"
+            )
+        self.skill_router = router
+
+    def _snapshot_context(self, state: InferenceState) -> None:
+        """Remember the prefilled prompt context before generate_text extends the cache."""
+        from g05.models.kv_cache import SparseKVCache
+
+        if state.attention_mask.size(0) != 1:
+            raise ValueError("skill-routed inference keeps routing state per stream: batch size must be 1")
+        recurrent = None
+        if isinstance(state.kv_cache, SparseKVCache):
+            # GatedDeltaNet folds every generated token into these; the KV tensors are only
+            # appended to (torch.cat), so slicing them later is enough.
+            recurrent = {i: t.clone() for i, t in state.kv_cache.recurrent_states.items() if t is not None}
+        state.context = {
+            "length": state.attention_mask.size(1),
+            "attention_mask": state.attention_mask,
+            "position_ids": state.position_ids,
+            "recurrent_states": recurrent,
+        }
+
+    def _context_cache(self, state: InferenceState) -> Dict[str, Any]:
+        """FM inputs restricted to the prompt context: what SkillExpertContextBuilder trains on."""
+        from g05.models.kv_cache import SparseKVCache
+
+        ctx = state.context
+        n = ctx["length"]
+        kv = state.kv_cache
+        if isinstance(kv, SparseKVCache):
+            cache = kv[:n]
+            for i, t in ctx["recurrent_states"].items():
+                cache.recurrent_states[i] = t
+        elif isinstance(kv, (list, tuple)):
+            cache = [(k[..., :n, :], v[..., :n, :]) for k, v in kv]
+        else:
+            raise TypeError(f"unsupported KV cache type for skill-routed FM: {type(kv).__name__}")
+        return {"attention_mask": ctx["attention_mask"], "kv_cache": cache, "position_ids": ctx["position_ids"]}
+
     @torch.no_grad()
     def forward_inference(
         self,
@@ -1026,6 +1086,9 @@ class G05Policy(BasePolicy):
         state = self.prefill(samples, pixel_values)
         _sync_if_cuda_available()
         timing["prefill_ms"] = (time.monotonic() - t0) * 1000.0
+        router = getattr(self, "skill_router", None)
+        if router is not None:
+            self._snapshot_context(state)
 
         # Stage 2: optional CoT generation (AR -> EOV stop).
         if self.predict_cot:
@@ -1041,6 +1104,16 @@ class G05Policy(BasePolicy):
             results["cot_text"] = state.generated_texts
             results["generated_ids"] = state.generated_ids
 
+        # Skill routing: the generated subtask picks the action expert, which then conditions on
+        # the prompt context only (the CoT stays out of the FM action expert's view).
+        fm_context = None
+        if router is not None:
+            route = router.route(state.generated_texts[0] if state.generated_texts else None)
+            results["skill_route"] = route
+            logger.info("[skill-route] %s", route)
+            if route["context_only"]:
+                fm_context = self._context_cache(state)
+
         # Stage 3: action generation.
         need_action = self.discrete_action or self.continuous_action
         if need_action:
@@ -1050,6 +1123,7 @@ class G05Policy(BasePolicy):
                 samples,
                 action_dim_is_pad=action_dim_is_pad,
                 action_gt=action_gt,
+                fm_context=fm_context,
             )
             _sync_if_cuda_available()
             timing["generate_action_total_ms"] = (time.monotonic() - t0) * 1000.0

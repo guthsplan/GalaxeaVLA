@@ -172,6 +172,9 @@ embodiment_datasets:
     skill_balance_alpha: 1.0
     skill_weights: null
     skill_annotation_root: ${oc.env:B1K_RAW_DEMOS,null}
+    # Skill-expert runs (g05/data/skill_groups.py): keep only frames whose annotated skill is in
+    # these groups, in BOTH splits, e.g. "grasp" or "revolute,linear". null / "all" = every frame.
+    skill_groups: null
     dataset_groups:
     - weight: 1.0
       dataset_dirs:

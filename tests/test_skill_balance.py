@@ -63,3 +63,20 @@ def test_uniform_is_stride_jitter(tmp_path):
     idx = _index(tmp_path, 1.0, {}, n=200)
     for i in range(200):
         assert i * 10 <= idx(i) < i * 10 + 10
+
+
+def test_keep_skills_filters_every_other_skill(tmp_path):
+    # skill-expert runs: only "pick" frames are drawn, uniformly over them
+    _index(tmp_path, 1.0, {}, n=200)  # writes the two annotation files
+    idx = SkillBalancedIndex(*_index_args(tmp_path), 200, 1.0, {}, keep_skills=["pick"])
+    np.random.seed(0)
+    frames = [idx(i) for _ in range(20) for i in range(200)]
+    assert {idx.skill_of(f) for f in frames} == {"pick"}
+    with pytest.raises(ValueError):
+        SkillBalancedIndex(*_index_args(tmp_path), 200, 1.0, {}, keep_skills=["pour"])
+
+
+def _index_args(tmp_path):
+    meta = types.SimpleNamespace(episodes=_Cols({"annotation_path": ["annotations/ep0.json", "annotations/ep1.json"]}))
+    ds = types.SimpleNamespace(meta=meta, root=str(tmp_path))
+    return [ds], [0, 1000], [1000, 2000], 0, 2000

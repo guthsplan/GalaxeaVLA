@@ -1,0 +1,65 @@
+# @package _global_
+# Skill-specific action expert: action-expert-only LoRA on top of a CoT LoRA checkpoint, trained on
+# the frames of one skill group (g05/data/skill_groups.py), flow matching only.
+#
+# Serving (scripts/serve_g05_b1k.py --skill-experts ...): the CoT checkpoint prefills the
+# SubtaskCoTBuilder prompt, generates "Subtask: ...", the subtask picks the expert
+# (g05/models/g05/skill_router.py), and the expert's flow matching conditions on the prompt
+# context ONLY: the KV cache and GatedDeltaNet states as they were before the CoT was generated
+# (G05Policy._context_cache). Training here reproduces exactly that input:
+#
+#   1. Samples  -> SkillExpertContextBuilder: the SubtaskCoTBuilder prompt cut at <EOC>
+#                  ("... State: <proprio>; predict subtask\n"). No <EOV>, so the whole sequence is
+#                  the FM prefix and the action expert attends to nothing else. No CoT labels needed.
+#   2. Objective-> FM only: discrete_action=false, predict_cot=false (G05Policy skips the CE loss).
+#   3. LoRA     -> adapters on the action expert only; the VLM, vision tower and proprio embedder
+#                  stay frozen, so every expert shares the CoT checkpoint's VLM and its prompt KV.
+#                  Fully trained: the small action-expert I/O modules. The adaLN modulation (151M)
+#                  stays frozen unless lora.trainable_modules adds it (--train-adaln in the launcher).
+#   4. Data     -> data.embodiment_datasets.behavior_r1pro.skill_groups=<groups> keeps only the
+#                  frames of those skills, in the training AND validation split; "all" trains the
+#                  fallback expert used for groups without their own expert.
+#
+#   bash scripts/train_g05_skill_expert.sh <EXP> --group grasp --ckpt <cot_lora>/checkpoints/step_N.pt
+#   python tools/export_skill_expert.py <run>/checkpoints/step_M.pt -o experts/grasp.pt
+#
+# Warm-start from the CoT LoRA checkpoint you will serve (model.pretrained_ckpt): the exporter and
+# the router check that the VLM is bit-identical to it.
+defaults:
+- behavior_cot_lora
+- _self_
+
+model:
+  find_unused_parameters: true
+
+  lora:
+    enabled: true
+    targets:
+    - action_expert
+    trainable_modules:
+    - action_expert.input_proj
+    - action_expert.output_proj
+    - action_expert.time_mlp_in
+    - action_expert.time_mlp_out
+    - action_expert.norm
+
+  model_arch:
+    discrete_action: false
+    continuous_action: true
+    return_continuous_action: true
+    predict_cot: false
+
+  processor:
+    samples_builder:
+      candidates:
+      - _target_: g05.data_processor.processor.samples_builder.SkillExpertContextBuilder
+        weight: 1.0
+      # Validation must see the same context-only prompt (the served CoT prompt is set by the
+      # CoT checkpoint's own task config, not by this file).
+      eval_builder:
+        _target_: g05.data_processor.processor.samples_builder.SkillExpertContextBuilder
+
+data:
+  embodiment_datasets:
+    behavior_r1pro:
+      skill_groups: null   # set per run, e.g. grasp | revolute,linear | all

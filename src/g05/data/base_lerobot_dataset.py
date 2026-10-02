@@ -10,6 +10,7 @@ import torch
 from tqdm import tqdm
 
 from g05.data.skill_balance import SkillBalancedIndex, parse_skill_weights
+from g05.data.skill_groups import ALL, parse_groups, skills_of
 from g05.data_processor.processor.base_processor import BaseProcessor
 from g05.utils.logging.logging_config import get_logger
 
@@ -113,6 +114,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         skill_balance_alpha: float = 1.0,
         skill_weights: Union[None, str, Dict[str, float]] = None,
         skill_annotation_root: Optional[str] = None,
+        # skill-expert runs (g05.data.skill_groups): keep only frames whose annotated skill is in
+        # these groups, e.g. "grasp,place"; applies to the validation split too. null / "all" = off
+        skill_groups: Union[None, str, List[str]] = None,
         **kwargs,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
@@ -312,7 +316,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         self._skill_index = None
         skill_weights = parse_skill_weights(_to_plain(skill_weights))
-        if self.is_training_set and (float(skill_balance_alpha) != 1.0 or skill_weights):
+        groups = parse_groups(_to_plain(skill_groups))
+        keep_skills = skills_of(groups) if groups and groups != [ALL] else None
+        balance = self.is_training_set and (float(skill_balance_alpha) != 1.0 or bool(skill_weights))
+        if balance or keep_skills is not None:
+            # The validation split is only filtered by skill group, never re-balanced.
             self._skill_index = SkillBalancedIndex(
                 datasets=self.multi_dataset._datasets,
                 episode_from=self.episode_data_index["from"].tolist(),
@@ -320,9 +328,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 start_idx=self._start_idx,
                 end_idx=self._end_idx,
                 num_samples=len(self),
-                alpha=float(skill_balance_alpha),
-                skill_weights=skill_weights,
+                alpha=float(skill_balance_alpha) if balance else 1.0,
+                skill_weights=skill_weights if balance else {},
                 annotation_root=skill_annotation_root,
+                keep_skills=keep_skills,
             )
 
     def _setup_meta_lerobot_keys(self):
