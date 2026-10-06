@@ -1,0 +1,95 @@
+# @package _global_
+# G0.5 CoT LoRA fine-tuning on BEHAVIOR: behavior_cot_v2's CoT mix WITHOUT the belief-graph
+# targets, AR + FM.
+#
+# Inherits behavior_cot_v2.yaml (no BeliefGraph input slot, predict_cot, pred_eov) and changes
+# four things:
+#
+#   1. CoT mix  -> the non-belief-graph builders of behavior_cot_v2 (same weights):
+#                  AtomicTaskBase, BBoxSubtask, Subtask, BBox, Trace2D. Dropped: Delta, Update,
+#                  Observe, Effect, FullBelief, ObserveUpdate, SubtaskEffect (the last one
+#                  carries an Effect: field). behavior_cot_lora_bg.yaml restores them.
+#   2. Objective-> AR CE (CoT + ActionCodec tokens) AND flow matching on the action expert.
+#                  loss = ar.ce_weight * ce_loss + fm.fm_weight * fm_loss (g05_policy.py).
+#                  At inference the executed action is the FM one (generate_action keeps
+#                  results["action"] from inference_fm; the AR decode goes to "ar_action").
+#   3. Gripper  -> rule_based_key_patterns: [gripper] (as behavior.yaml / g05_all100), i.e. the
+#                  v2 gripper no-op-dropout fix is REVERTED here. Executed actions come from FM,
+#                  whose loss always covers the gripper dims, so the dropout only thins the AR
+#                  auxiliary targets; in exchange the ActionCodec token layout matches g05_all100
+#                  and its AR action rows load 1:1 (no token remap).
+#   4. LoRA     -> adapters on the VLM decoder AND the action expert (attention, MLP).
+#                  Fully trained: the action expert's adaLN modulation (cannot take an adapter,
+#                  see lora.py), 27-D I/O projections and time MLP, plus the proprio embedder.
+#                  Vision tower and embeddings frozen (g05/models/g05/lora.py).
+#
+#     TASK_CONFIG=behavior_cot_lora    bash scripts/train_g05_cot.sh <EXP> ...   # BG off
+#     TASK_CONFIG=behavior_cot_lora_bg bash scripts/train_g05_cot.sh <EXP> ...   # BG on
+#   or scripts/train_g05_cot_lora.sh --bg on|off, which picks between the two.
+#
+# Labels: atomic_task_index (Subtask, from the skill annotations), bbox_index, 2d_trace_index,
+# built by scripts/build_cot_bbox_trace.sh (tools/build_b1k_bbox_trace_sidecars.py +
+# tools/merge_b1k_cot_labels.py). Subtask covers every annotated frame, so the BaseSamplesBuilder
+# (no-CoT) fallback only fires on unannotated episodes.
+defaults:
+- behavior_cot_v2
+- _self_
+
+model:
+  # Both heads receive gradient now, but find_unused_parameters stays true: frozen params and
+  # samples whose CoT tokens are absent must not trip DDP's reduction check.
+  find_unused_parameters: true
+
+  lora:
+    enabled: true
+    targets:
+    - vlm
+    - action_expert
+    # Trained in full on top of the adapters (~161M params):
+    #  - adaLN modulation: AdaptiveRMSNorm calls F.linear on dense.weight directly, which
+    #    bypasses a LoRA wrapper, so it is trained in full (151M)
+    #  - tied to this embodiment's 27-D action / proprio space, or too small for low rank
+    trainable_modules:
+    - action_expert\.layers\.\d+\.(input|post_attention)_layernorm
+    - action_expert.input_proj
+    - action_expert.output_proj
+    - action_expert.time_mlp_in
+    - action_expert.time_mlp_out
+    - action_expert.norm
+    - proprio_embedder
+
+  model_arch:
+    discrete_action: true
+    continuous_action: true
+    return_continuous_action: true
+    # Activation checkpointing of the VLM decoder (non-reentrant, safe with frozen base
+    # weights). Needed to fit a 24 GB GPU; turn off on larger cards for speed.
+    checkpoint_vlm: true
+    fm:
+      # false (default): FM loss trains only the action expert; the VLM KV it attends to is
+      # detached. true: FM gradient also reaches the VLM LoRA adapters.
+      joint_training: false
+
+  processor:
+    samples_builder:
+      candidates:
+      - _target_: g05.data_processor.processor.samples_builder.AtomicTaskBaseSamplesBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.BBoxSubtaskCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.BBoxCoTBuilder
+        weight: 1.0
+      - _target_: g05.data_processor.processor.samples_builder.Trace2DCoTBuilder
+        weight: 1.0
+      # Which CoT the policy generates before acting at eval time (as behavior_cot_v2).
+      # BBoxCoTBuilder / AtomicTaskBase cannot be: their eval_required_fields need labels.
+      eval_builder:
+        _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder
+
+tokenizer:
+  vq_config:
+    # Back to behavior.yaml's value (behavior_cot_v2.yaml sets []). See point 3 above.
+    rule_based_key_patterns:
+    - gripper

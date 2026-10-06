@@ -61,6 +61,8 @@ from g05.utils.logging.log_box import log_box
 from g05.utils.config.config_resolvers import register_default_resolvers
 from g05.utils.checkpoint.ckpt_utils import copy_hf_processor_files
 from g05.utils.checkpoint.checkpoint_utils import (
+    save_best_checkpoint,
+    resume_best_metric,
     fix_optimizer_state_after_resume,
     save_training_checkpoint,
 )
@@ -69,6 +71,7 @@ from utils.metric import resolve_parts_meta
 from utils.preflight import build_filter_str, run_preflight_checks
 from utils.eval_snapshot import save_train_snapshot
 from utils.train_eval import PeriodicEvaluator
+from utils.tiling_eval import TilingEvaluator
 
 register_default_resolvers()
 
@@ -587,6 +590,17 @@ def finetune(cfg: DictConfig):
     # Force critical layers to float32 (patterns defined per-model in fp32_param_patterns)
     model.apply_fp32_params()
 
+    # LoRA: inject adapters into the loaded weights and freeze the rest. Before EMA /
+    # DDP / optimizer, which all capture the parameter set (see g05/models/g05/lora.py).
+    lora_cfg = cfg.model.get("lora", None)
+    lora_grads_unchecked = bool(lora_cfg is not None and lora_cfg.get("enabled", False))
+    if lora_grads_unchecked:
+        from g05.models.g05.lora import apply_lora, check_adapter_grads, summarize_trainable
+
+        apply_lora(model, lora_cfg, resume_checkpoint=checkpoint if cfg.resume_ckpt else None)
+        for line in summarize_trainable(model):
+            logger.info(f"  trainable {line}")
+
     use_ema = cfg.model.use_ema
     if use_ema:
         ema_model = EMA(
@@ -780,14 +794,30 @@ def finetune(cfg: DictConfig):
     sampler_num_replicas = accelerator.num_processes
     sampler_rank = accelerator.process_index
     overfit_shuffle = overfit_batch is None
-    train_sampler = ResumableDistributedSampler(
-        train_dataset,
-        num_replicas=sampler_num_replicas,
-        rank=sampler_rank,
-        seed=cfg.seed,
-        shuffle=overfit_shuffle,
-        batch_size=cfg.model.batch_size,
-    )
+    skill_sampler_cfg = cfg.get("skill_sampler", None)
+    if skill_sampler_cfg is not None and skill_sampler_cfg.get("enabled", False):
+        # Skill-balanced start frames (g05/data/skill_sampler.py); the per-rank stream resumes from
+        # (epoch, action_batch_idx) like ResumableDistributedSampler.
+        from g05.data.skill_sampler import build_skill_sampler
+
+        assert overfit_batch is None, "skill_sampler and overfit_batch are mutually exclusive"
+        train_sampler = build_skill_sampler(
+            skill_sampler_cfg,
+            train_dataset,
+            batch_size=cfg.model.batch_size,
+            num_replicas=sampler_num_replicas,
+            rank=sampler_rank,
+            seed=cfg.seed,
+        )
+    else:
+        train_sampler = ResumableDistributedSampler(
+            train_dataset,
+            num_replicas=sampler_num_replicas,
+            rank=sampler_rank,
+            seed=cfg.seed,
+            shuffle=overfit_shuffle,
+            batch_size=cfg.model.batch_size,
+        )
     eval_sampler = DistributedSampler(
         eval_dataset,
         num_replicas=sampler_num_replicas,
@@ -839,7 +869,31 @@ def finetune(cfg: DictConfig):
         eval_processor=eval_processor,
         parts_meta=eval_parts_meta,
         output_dir=output_dir,
+        num_batches=int(cfg.get("eval_num_batches", 1)),
     )
+
+    # Fixed full-coverage validation (utils/tiling_eval.py) for best-checkpoint selection; runs inside the
+    # periodic eval every eval_tiling.every steps (a multiple of eval_steps).
+    tiling_evaluator = None
+    tiling_cfg = cfg.get("eval_tiling", None)
+    if tiling_cfg is not None and tiling_cfg.get("enabled", False):
+        assert int(tiling_cfg.every) % int(cfg.eval_steps) == 0, "eval_tiling.every must be a multiple of eval_steps"
+        _ss = cfg.get("skill_sampler", None) or {}
+        tiling_evaluator = TilingEvaluator(
+            eval_dataset,
+            tiling_cfg,
+            annotations_root=tiling_cfg.get("annotations_root") or _ss.get("annotations_root"),
+            batch_size=cfg.batch_size_val,
+            num_workers=dl_num_workers,
+            collate_fn=action_collate_fn,
+            worker_init_fn=worker_init_fn,
+            processor=eval_processor,
+            parts_meta=eval_parts_meta,
+            output_dir=output_dir,
+            rank=sampler_rank,
+            world_size=sampler_num_replicas,
+            seed=cfg.seed,
+        )
 
     if overfit_batch is not None:
         logger.info(
@@ -1115,6 +1169,11 @@ def finetune(cfg: DictConfig):
     # Train!
     logger.info("Starting training...")
     training_done = False
+    # cfg.best_metric_mode: "max" (default; e.g. ar_action_acc) or "min" (e.g. fm_action_l1, lower is better)
+    _best_min = str(getattr(cfg, "best_metric_mode", "max")).lower() == "min"
+    best_metric_value = float(resume_best_metric(cfg))
+    if _best_min and best_metric_value == float("-inf"):
+        best_metric_value = float("inf")
     with tqdm.tqdm(initial=step, total=max_steps, leave=False, dynamic_ncols=True) as progress:
         latest_action_eval_batch = None
         _period_train_start = time.time()
@@ -1198,6 +1257,11 @@ def finetune(cfg: DictConfig):
                 batch_idx += 1
 
                 if is_optimizer_step:
+                    if lora_grads_unchecked:
+                        # An adapter whose base Linear is bypassed (F.linear on .weight) never
+                        # sees a gradient; fail on the first step rather than train it silently.
+                        check_adapter_grads(unwrap_model(model))
+                        lora_grads_unchecked = False
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), cfg.model.max_grad_norm
                     )
@@ -1273,7 +1337,26 @@ def finetune(cfg: DictConfig):
                                 eval_batch=eval_batch,
                             )
                             _eval_time = eval_log_dict.pop("_eval_time_sec", 0.0)
+                            if tiling_evaluator is not None and step % int(tiling_cfg.every) == 0:
+                                _tiling = tiling_evaluator.evaluate(unwrap_model(model), accelerator, step)
+                                _eval_time += _tiling.pop("_eval_time_sec", 0.0)
+                                eval_log_dict.update(_tiling)
                             log_dict.update(eval_log_dict)
+                            # Best-metric checkpoint (inference-only) whenever the tracked eval metric
+                            # improves; the metric name comes from cfg.best_metric (default: AR action
+                            # accuracy of the rollout eval) and the direction from cfg.best_metric_mode.
+                            # Written atomically to checkpoints/best.pt.
+                            _best_key = getattr(cfg, "best_metric", "eval/action/rollout/ar_action_acc")
+                            _cur = eval_log_dict.get(_best_key)
+                            _improved = _cur is not None and _cur >= 0 and (
+                                float(_cur) < best_metric_value if _best_min else float(_cur) > best_metric_value)
+                            if _improved and not _dry_run:
+                                best_metric_value = float(_cur)
+                                if accelerator.is_main_process:
+                                    logger.info(f"New best {_best_key}={best_metric_value:.4f} at step {step}: saving checkpoints/best.pt")
+                                    save_best_checkpoint(output_dir, step=step, epoch=epoch, model=unwrap_model(model),
+                                                         metric_name=_best_key, metric_value=best_metric_value)
+                                accelerator.wait_for_everyone()
                             _total_time = _train_time_in_period + _eval_time
                             if _total_time > 0:
                                 log_dict["performance/train_eval_time_ratio"] = (

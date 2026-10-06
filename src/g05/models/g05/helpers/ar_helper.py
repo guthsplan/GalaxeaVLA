@@ -343,6 +343,7 @@ class ARHelper:
         return_kv_cache: bool = False,
         past_key_values: Optional[List] = None,
         stop_token_ids: Optional[List[int]] = None,
+        forced_ids: Optional[torch.Tensor] = None,
         verbose: bool = False,
         **kwargs,
     ) -> dict:
@@ -436,6 +437,7 @@ class ARHelper:
             return_kv_cache=return_kv_cache,
             past_key_values=past_key_values,
             stop_token_ids=stop_token_ids,
+            forced_ids=forced_ids,
             verbose=verbose,
             **sampling_kwargs,
         )
@@ -454,10 +456,13 @@ class ARHelper:
         return_kv_cache: bool = False,
         past_key_values: List = None,
         stop_token_ids: Optional[List[int]] = None,
+        forced_ids: Optional[torch.Tensor] = None,
         verbose: bool = False,
         **sampling_kwargs,
     ) -> dict:
         """Batched parallel AR decode. The caller owns prefill.
+
+        forced_ids: [B, k] teacher-forced tokens for the first k steps (CoT forcing).
 
         Invariants:
           - attention_mask.size(1) always equals past_key_values length and grows with it
@@ -527,6 +532,12 @@ class ARHelper:
             sampled_token = self._sample(
                 logits[:, -1, :], prev_tokens=token_history, **sampling_kwargs
             )
+            # Teacher forcing: while forced_ids has a token for this step, commit it instead of
+            # the sampled one. The KV cache still grows through the normal path below, so the
+            # action stage is conditioned exactly as if the model had produced this text.
+            if forced_ids is not None and step < forced_ids.shape[1]:
+                sampled_token = forced_ids[:, step : step + 1].to(sampled_token.device,
+                                                                  dtype=sampled_token.dtype)
             next_token = torch.where(
                 finished,
                 torch.full_like(sampled_token, finished_fill_id),

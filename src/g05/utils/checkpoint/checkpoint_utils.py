@@ -255,6 +255,110 @@ def _build_bar_token_row_remap_config(model, state_dict: Dict[str, torch.Tensor]
     }
 
 
+def _source_run_vq_config(ckpt_path: str) -> dict | None:
+    """The tokenizer vq_config of the run that wrote ``ckpt_path``, from its Hydra dump.
+
+    ``<run>/checkpoints/<ckpt>.pt`` -> ``<run>/.hydra/config.yaml``. Only literal values are
+    returned (unresolved ``${...}`` interpolations are dropped); None when there is no dump.
+    """
+    from pathlib import Path
+
+    import yaml
+
+    hydra_cfg = Path(ckpt_path).resolve().parent.parent / ".hydra" / "config.yaml"
+    if not hydra_cfg.exists():
+        return None
+    cfg = yaml.safe_load(hydra_cfg.read_text()) or {}
+    tok = cfg.get("tokenizer") or (cfg.get("model") or {}).get("tokenizer") or {}
+    vq = tok.get("vq_config") or {}
+    return {k: v for k, v in vq.items() if not (isinstance(v, str) and "${" in v)}
+
+
+def _build_vq_layout_remap_config(
+    model, model_arch_cfg, state_dict: Dict[str, torch.Tensor], ckpt_path: str
+) -> dict | None:
+    """Token-row remap for checkpoints whose ActionCodec token layout differs from the model's.
+
+    Added tokens are registered as [action tokens..., <EOV>, <state>], so changing a tokenizer
+    knob that alters the action-token list (e.g. ``rule_based_key_patterns: [gripper] -> []``
+    turns the single ``<left_gripper>`` marker into ``<left_gripper_0..3>``) shifts every later
+    id. A prefix partial load would then give ``<EOV>`` / ``<state>`` and the trailing markers
+    the wrong rows. The checkpoint's layout is rebuilt from its run's ``.hydra/config.yaml`` and
+    rows are moved by token string.
+
+    A token new to this model is seeded from its per-part counterpart in the checkpoint
+    (``<left_gripper_2>`` <- ``<left_gripper>``): the model was instantiated from scratch, so
+    its own rows are N(0, 1) with norm ~sqrt(hidden) = 45 against ~1.4 for trained rows, and
+    with tied embeddings those rows would dominate every softmax (CE ~100 at step 0).
+    """
+    processor = getattr(model, "processor", None)
+    at = getattr(model, "action_tokenizer", None)
+    if processor is None or at is None or not hasattr(processor, "get_added_token_id_map"):
+        return None
+    local_state = model.state_dict()
+    keys = [
+        k for k in ("model.vlm.input_proj.weight", "model.vlm.output_proj.weight")
+        if k in state_dict and k in local_state
+        and state_dict[k].shape[0] != local_state[k].shape[0]
+    ]
+    if not keys:
+        return None
+    source_vq = _source_run_vq_config(ckpt_path)
+    if not source_vq:
+        logger.info("Token layout remap skipped: no .hydra/config.yaml next to the checkpoint's run")
+        return None
+
+    from omegaconf import OmegaConf
+
+    current_vq = OmegaConf.to_container(model_arch_cfg.AT_CONFIG, resolve=True)
+    changed = {k: v for k, v in source_vq.items() if k in current_vq and current_vq[k] != v}
+    if not changed:
+        return None
+
+    new_token_to_id = processor.get_added_token_id_map()
+    base = min(new_token_to_id.values())  # first added id == vocab size before registration
+    old_vq = OmegaConf.create({**current_vq, **changed})
+    old_at = type(at)(vq_config=old_vq, vocab_offset=base, hf_vocab_size=base)
+    old_tokens = list(old_at.new_action_tokens) + ["<EOV>"]
+    if "<state>" in new_token_to_id:
+        old_tokens.append("<state>")
+    old_token_to_id = {tok: base + i for i, tok in enumerate(old_tokens)}
+
+    # Both embeddings carry the same padding past the last added token; if they do not, the
+    # rebuilt layout is not the checkpoint's and remapping would be worse than a prefix load.
+    ckpt_rows, local_rows = state_dict[keys[0]].shape[0], local_state[keys[0]].shape[0]
+    old_end, new_end = base + len(old_tokens), max(new_token_to_id.values()) + 1
+    if ckpt_rows - old_end != local_rows - new_end:
+        logger.warning(
+            f"Token layout remap skipped: rebuilt layout ({old_end} ids) does not fit the "
+            f"checkpoint's {ckpt_rows} rows (model: {new_end} ids / {local_rows} rows)"
+        )
+        return None
+
+    import re
+
+    moved = sum(1 for t, i in old_token_to_id.items() if t in new_token_to_id and new_token_to_id[t] != i)
+    seeded, unseeded = {}, []
+    for tok in new_token_to_id:
+        if tok in old_token_to_id:
+            continue
+        m = re.fullmatch(r"<(.+)_\d+>", tok)
+        alias = f"<{m.group(1)}>" if m else None
+        if alias in old_token_to_id:
+            seeded[tok] = alias
+        else:
+            unseeded.append(tok)
+    remap_from = dict(old_token_to_id)
+    remap_from.update({tok: old_token_to_id[alias] for tok, alias in seeded.items()})
+    logger.warning(
+        f"Token layout remap: checkpoint tokenizer differs in {sorted(changed)}; "
+        f"{moved} token rows move by name; {len(seeded)} new token(s) seeded from their "
+        f"counterpart (e.g. {list(seeded.items())[:2]})"
+        + (f"; {len(unseeded)} keep a random init: {unseeded[:4]}" if unseeded else "")
+    )
+    return {"old_token_to_id": remap_from, "new_token_to_id": new_token_to_id, "keys": keys}
+
+
 def load_state_dict_safely(
     model,
     state_dict,
@@ -635,6 +739,8 @@ def load_model_from_checkpoint(
         load_config = dict(load_config)
     if load_config.get("auto_token_row_remap", True) and "token_row_remap" not in load_config:
         token_row_remap = _build_bar_token_row_remap_config(model, state_dict)
+        if token_row_remap is None:
+            token_row_remap = _build_vq_layout_remap_config(model, model_arch_cfg, state_dict, ckpt_path)
         if token_row_remap is not None:
             load_config["token_row_remap"] = token_row_remap
 
@@ -729,15 +835,21 @@ def save_training_checkpoint(
     output_dir = Path(output_dir)
     path = output_dir / "checkpoints" / f"step_{step}.pt"
     path.parent.mkdir(parents=True, exist_ok=True)
+    # LoRA runs are saved merged, in the plain layout, so they load like any other
+    # checkpoint; the raw adapters ride along only for resume (models/g05/lora.py).
+    from g05.models.g05.lora import adapter_state_dict, export_state_dict, has_lora
+
     state = {
         "step": step,
         "epoch": epoch,
         "batch_idx": batch_idx,
-        "model_state_dict": model.state_dict() if model is not None else None,
+        "model_state_dict": export_state_dict(model) if model is not None else None,
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
-        "ema_model_state_dict": ema_model.ema_model.state_dict() if ema_model is not None else None,
+        "ema_model_state_dict": export_state_dict(ema_model.ema_model) if ema_model is not None else None,
     }
+    if model is not None and has_lora(model):
+        state["lora_state_dict"] = adapter_state_dict(model)
     state.update(extra_state)
     torch.save(state, path)
 
@@ -771,9 +883,70 @@ def fix_optimizer_state_after_resume(optimizer) -> int:
                 if isinstance(v, torch.Tensor):
                     if v.is_floating_point() and v.dtype != p.dtype:
                         state[k] = v.to(dtype=p.dtype)
-                    if v.shape != p.shape:
+                    # 0-dim entries (Adam's `step`) are per-param scalars, not param-shaped
+                    if v.dim() > 0 and v.shape != p.shape:
                         need_reset = True
             if need_reset:
                 reset_count += 1
                 optimizer.state[p] = {}
     return reset_count
+
+
+def save_best_checkpoint(output_dir, step: int, epoch: int, model, metric_name: str, metric_value: float):
+    """Inference-only checkpoint of the best eval metric so far -> ``output_dir/checkpoints/best.pt``
+    (written to best.pt.tmp first, then renamed) plus ``checkpoints/best_metric.json``.
+
+    LoRA runs are saved merged like ``save_training_checkpoint``; the raw adapters are kept so
+    the file can still seed a LoRA run. No optimizer/scheduler state: use step_N.pt to resume.
+    """
+    import json
+    from pathlib import Path
+
+    from g05.models.g05.lora import adapter_state_dict, export_state_dict, has_lora
+
+    output_dir = Path(output_dir)
+    ckdir = output_dir / "checkpoints"
+    ckdir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "step": step,
+        "epoch": epoch,
+        "batch_idx": 0,
+        "model_state_dict": export_state_dict(model),
+        "optimizer_state_dict": None,
+        "scheduler_state_dict": None,
+        "ema_model_state_dict": None,
+        "best_metric": {"name": metric_name, "value": float(metric_value), "step": step},
+    }
+    if has_lora(model):
+        state["lora_state_dict"] = adapter_state_dict(model)
+    tmp = ckdir / "best.pt.tmp"
+    torch.save(state, tmp)
+    tmp.replace(ckdir / "best.pt")
+    (ckdir / "best_metric.json").write_text(
+        json.dumps({"name": metric_name, "value": float(metric_value), "step": step}, indent=2))
+    return ckdir / "best.pt"
+
+
+def resume_best_metric(cfg) -> float:
+    """Best metric value recorded by a previous run of the same output dir (for ``resume_ckpt``),
+    else -inf so the first eval becomes the best."""
+    import json
+    from pathlib import Path
+
+    try:
+        out = Path(str(cfg.output_dir)) if getattr(cfg, "output_dir", None) else None
+    except Exception:
+        out = None
+    if out is None:
+        try:
+            from hydra.core.hydra_config import HydraConfig
+            out = Path(HydraConfig.get().runtime.output_dir)
+        except Exception:
+            return float("-inf")
+    p = out / "checkpoints" / "best_metric.json"
+    if getattr(cfg, "resume_ckpt", None) and p.exists():
+        try:
+            return float(json.loads(p.read_text())["value"])
+        except Exception:
+            return float("-inf")
+    return float("-inf")

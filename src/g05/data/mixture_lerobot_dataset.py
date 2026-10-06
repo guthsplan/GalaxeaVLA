@@ -101,6 +101,7 @@ class MixtureLerobotDataset(torch.utils.data.Dataset):
         past_action_size: int,
         val_set_proportion: float,
         is_training_set: bool,
+        val_split_by_task: bool = False,
         obs_size: int = 1,
         obs_stride_second: float = 0.0,
         use_weight_for_sampling: bool = False,
@@ -156,6 +157,7 @@ class MixtureLerobotDataset(torch.utils.data.Dataset):
                 ds_obs_size = emb_ds_cfg.pop("obs_size", obs_size)
                 ds_obs_stride_second = emb_ds_cfg.pop("obs_stride_second", obs_stride_second)
                 ds_val_set_proportion = emb_ds_cfg.pop("val_set_proportion", val_set_proportion)
+                ds_val_split_by_task = emb_ds_cfg.pop("val_split_by_task", val_split_by_task)
                 ds_override_fps = emb_ds_cfg.pop("override_fps", None)
 
                 for group_idx, group in enumerate(dataset_groups):
@@ -205,6 +207,7 @@ class MixtureLerobotDataset(torch.utils.data.Dataset):
                         obs_size=ds_obs_size,
                         obs_stride_second=ds_obs_stride_second,
                         val_set_proportion=ds_val_set_proportion,
+                        val_split_by_task=ds_val_split_by_task,
                         override_fps=ds_override_fps,
                         is_training_set=is_training_set,
                     )

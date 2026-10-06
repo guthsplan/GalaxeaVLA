@@ -26,6 +26,20 @@ use_ema: false
 ema:
   update_after_step: 0
   power: 0.67
+# LoRA on the VLM decoder (g05/models/g05/lora.py). Off by default: full fine-tune.
+# Checkpoints are saved merged, so serving is unchanged.
+lora:
+  enabled: false
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  targets:                      # presets in lora.TARGET_PRESETS: vlm, action_expert
+  - vlm
+  target_regex: null            # full-match regex over G05Model module names; overrides targets
+  trainable_modules:            # fully trained on top of the adapters (prefixes under G05Model)
+  - action_expert
+  - proprio_embedder
+  frozen_dtype: bf16            # frozen weight matrices stored in bf16 (autocast runs them in bf16 anyway)
 use_sync_bn: false
 collate_fn: identity
 model_arch:

@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 class PeriodicEvaluator:
     """Runs one eval batch periodically during training and returns log metrics."""
 
-    def __init__(self, eval_dataloader, eval_sampler, eval_processor, parts_meta, output_dir):
+    def __init__(self, eval_dataloader, eval_sampler, eval_processor, parts_meta, output_dir, num_batches: int = 1):
+        self.num_batches = max(1, int(num_batches))
         self.eval_dataloader = eval_dataloader
         self.eval_sampler = eval_sampler
         self.eval_processor = eval_processor
@@ -46,32 +47,51 @@ class PeriodicEvaluator:
         plus the eval wall time under ``_eval_time_sec`` (not logged by tracker prefix).
         """
         start_time = time.time()
-        if eval_batch is None:
-            eval_batch = self._next_batch()
-
-        rollout_metrics, per_emb_raw, eval_preds = rollout_and_calculate_metrics(
-            eval_batch,
-            model,
-            accelerator,
-            processor=self.eval_processor,
-            return_per_emb_raw=True,
-            return_preds=True,
-            parts_meta=self.parts_meta,
-        )
-        if dist.is_initialized():
-            # All ranks must participate in the collective op unconditionally,
-            # even when this rank's dict is empty, otherwise other ranks hang.
-            rollout_metrics = reduce_payload(
-                {
-                    k: (v.item() if hasattr(v, "item") else float(v))
-                    for k, v in rollout_metrics.items()
-                }
+        n_batches = 1 if eval_batch is not None else self.num_batches
+        sums, counts = {}, {}
+        for _ in range(n_batches):
+            if eval_batch is None or n_batches > 1:
+                batch = self._next_batch() if (eval_batch is None) else eval_batch
+            else:
+                batch = eval_batch
+            rollout_metrics, per_emb_raw, eval_preds = rollout_and_calculate_metrics(
+                batch,
+                model,
+                accelerator,
+                processor=self.eval_processor,
+                return_per_emb_raw=True,
+                return_preds=True,
+                parts_meta=self.parts_meta,
             )
-            per_emb_metrics = reduce_per_emb_metrics(per_emb_raw or {})
-            rollout_metrics.update(per_emb_metrics)
-        elif per_emb_raw:
-            per_emb_metrics = reduce_per_emb_metrics(per_emb_raw)
-            rollout_metrics.update(per_emb_metrics)
+            if dist.is_initialized():
+                # All ranks must participate in the collective op unconditionally,
+                # even when this rank's dict is empty, otherwise other ranks hang.
+                rollout_metrics = reduce_payload(
+                    {
+                        k: (v.item() if hasattr(v, "item") else float(v))
+                        for k, v in rollout_metrics.items()
+                    }
+                )
+                per_emb_metrics = reduce_per_emb_metrics(per_emb_raw or {})
+                rollout_metrics.update(per_emb_metrics)
+            elif per_emb_raw:
+                per_emb_metrics = reduce_per_emb_metrics(per_emb_raw)
+                rollout_metrics.update(per_emb_metrics)
+            # average numeric metrics over the batches (the snapshot below uses the last batch)
+            for k, v in rollout_metrics.items():
+                try:
+                    fv = float(v.item() if hasattr(v, "item") else v)
+                except Exception:
+                    sums[k] = v
+                    counts[k] = None
+                    continue
+                if counts.get(k) is None and k in sums:
+                    continue
+                sums[k] = sums.get(k, 0.0) + fv
+                counts[k] = counts.get(k, 0) + 1
+            eval_batch_used = batch
+        rollout_metrics = {k: (sums[k] / counts[k] if counts.get(k) else sums[k]) for k in sums}
+        eval_batch = eval_batch_used
 
         log_dict = {}
         for k, v in rollout_metrics.items():

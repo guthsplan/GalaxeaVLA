@@ -23,6 +23,9 @@ import argparse
 import asyncio
 import functools
 import logging
+import json
+import math
+import os
 import time
 
 from g05.utils.websocket import packb, unpackb
@@ -307,6 +310,9 @@ def build_obs_dict(raw_obs: dict, processor) -> dict:
         data["coarse_task"] = raw_obs["coarse_task"]
     if "plan" in raw_obs:
         data["plan"] = raw_obs["plan"]
+    if raw_obs.get("forced_cot"):
+        # teacher-force this CoT text in place of the model's own (subtask filter at serving time)
+        data["forced_cot"] = raw_obs["forced_cot"]
     frequency = raw_obs.get("frequency", 15)
     data["frequency"] = float(frequency)
     if isinstance(processor, MixtureProcessor):
@@ -335,10 +341,38 @@ class ChunkedPolicyWrapper:
             1 = RTC (recompute every call), >1 = chunk mode.
     """
 
-    def __init__(self, inferencer, processor, *, action_steps: int = 16):
+    def __init__(self, inferencer, processor, *, action_steps: int = 16, cot_filter=None,
+                 ensemble_m: float = 0.0, fm_prefix_steps: int = 0, proprio_bias=None):
         self.inferencer = inferencer
         self.processor = processor
         self.action_steps = action_steps
+        # Temporal ensembling (ACT): when > 0, the chunk predictions that overlap the current step
+        # are averaged with exponential weights w_i = exp(-m * i), i = age of the prediction in
+        # steps (0 = newest). Recomputation still happens every `action_steps` steps, so with
+        # action_steps=16 and a 32-step chunk every step is covered by 2 predictions.
+        # ensemble_m == 0 disables it and the plain receding-horizon path is used.
+        self.ensemble_m = float(ensemble_m)
+        # Parts excluded from averaging: the gripper command is binarised by sign downstream
+        # (a[idx] = 1 if v >= 0 else -1), so blending an opening and a closing command lands near
+        # zero and makes the sign flicker exactly while grasping. Those parts take the newest
+        # prediction instead.
+        self.ensemble_exclude = ("left_gripper", "right_gripper")
+        self._ens = []  # [(age, {part: ndarray[chunk, dim]})] predictions still covering this step
+        # cot_filter(proposed_text) -> text to execute. When it returns a different string the
+        # chunk is recomputed with that text teacher-forced, so the actions follow the filtered
+        # subtask instead of the proposed one.
+        self.cot_filter = cot_filter
+        # FM prefix inpainting: the next chunk's first `fm_prefix_steps` steps are pinned to the
+        # previous chunk's steps [action_steps, action_steps + d) (planned but not yet executed),
+        # and only the remaining steps are generated from noise. 0 disables it. The first call
+        # of an episode has no previous chunk and runs unconditioned.
+        self.fm_prefix_steps = int(fm_prefix_steps)
+        # Proprio bias correction: {part: [b_0..b_{n-1}]}. The demos' commanded joint position leads
+        # the measured one by ~b even at rest, while the eval robot tracks commands exactly, so the
+        # model starts every chunk ~b away from the current position and the joints drift by ~b per
+        # chunk. Feeding (state - b) restores the demo relation: the first command ~= the state.
+        # Only the first n dims of each part are shifted (arms 7, torso 4); None disables it.
+        self.proprio_bias = proprio_bias
         self._cached_chunk = None  # {part: ndarray[chunk_size, dim]}
         self._chunk_step = 0
         self._cot_text = None  # str or None, from last recompute
@@ -358,10 +392,35 @@ class ChunkedPolicyWrapper:
                 raise ValueError("need obs for recompute but got empty")
             t0 = time.monotonic()
             _parse_task_and_plan(raw_obs)
-            obs_dict = build_obs_dict(raw_obs, self.processor)
+            obs_dict = build_obs_dict(self._bias_corrected(raw_obs), self.processor)
+            prev_chunk = self._cached_chunk
+            prefix = self._take_prefix()
+            if prefix is not None:
+                # absolute actions go into the dummy action rows; the processor re-references
+                # them to the current state and normalizes them (inferencer._prepare)
+                for k, v in prefix.items():
+                    if k in obs_dict["action"]:
+                        obs_dict["action"][k][: v.shape[0]] = torch.as_tensor(v, dtype=torch.float32)
+                obs_dict["fm_prefix_steps"] = self.fm_prefix_steps
             actions = await asyncio.to_thread(self.inferencer.infer, [obs_dict])
             action = actions[0]
             self._cot_text = action.pop("_cot_text", None)
+            hyb_used = action.pop("_hybrid_ar_parts", None)
+            if hyb_used is not None:
+                self.hybrid_calls = getattr(self, "hybrid_calls", 0) + 1
+                self.hybrid_ar_used = getattr(self, "hybrid_ar_used", 0) + (1 if hyb_used else 0)
+                if self.hybrid_calls % 50 == 1:
+                    logger.info("Hybrid action: AR parts %s used (%d/%d calls had an AR part)",
+                                hyb_used, self.hybrid_ar_used, self.hybrid_calls)
+            if self.cot_filter is not None and self._cot_text:
+                keep = self.cot_filter(self._cot_text)
+                if keep and keep != self._cot_text:
+                    obs_dict["forced_cot"] = keep
+                    actions = await asyncio.to_thread(self.inferencer.infer, [obs_dict])
+                    action = actions[0]
+                    action.pop("_cot_text", None)
+                    action.pop("_hybrid_ar_parts", None)
+                    self._cot_text = keep
             # Drop keys the AR head did not confidently predict. The protocol
             # returns only predicted keys; each client fills/holds missing keys
             # itself (it knows its own expected key set). Generalizes beyond
@@ -378,6 +437,12 @@ class ChunkedPolicyWrapper:
             self._cached_chunk = dict_apply(
                 action, lambda x: x[0].numpy() if isinstance(x, torch.Tensor) else x
             )
+            if prefix is not None:
+                self._log_prefix_check(prefix)
+            elif prev_chunk is not None and os.environ.get("LOG_CHUNK_SEAM") == "1":
+                self._log_boundary_jump(prev_chunk)
+            if prev_chunk is not None and os.environ.get("LOG_CHUNK_SEAM") == "1":
+                self._log_tracking(prev_chunk, raw_obs.get("state", {}))
             self._chunk_step = 0
             logger.info(
                 "Recompute: %.1fms (next %d from cache)",
@@ -385,6 +450,8 @@ class ChunkedPolicyWrapper:
                 self.action_steps - 1,
             )
 
+        if self.ensemble_m > 0:
+            return self._ensembled_step(), self._cot_text
         single_step = {}
         for part, arr in self._cached_chunk.items():
             if arr.ndim >= 1 and self._chunk_step < arr.shape[0]:
@@ -394,10 +461,188 @@ class ChunkedPolicyWrapper:
         self._chunk_step += 1
         return single_step, self._cot_text
 
+    def _bias_corrected(self, raw_obs):
+        """raw_obs with state[part][:n] -= b (shallow copy; diagnostics keep the true state)."""
+        if not self.proprio_bias or "state" not in raw_obs:
+            return raw_obs
+        import numpy as np
+
+        state = dict(raw_obs["state"])
+        for k, b in self.proprio_bias.items():
+            if k in state:
+                v = np.array(state[k], dtype=np.float32, copy=True)
+                flat = v.reshape(-1)
+                spec = b if isinstance(b, dict) else {"W" if np.ndim(b) == 2 else "b": b}
+                if "W" in spec:
+                    # posture-dependent b(s) = [s, sin s, cos s, 1] @ W  (W: [3n+1, n]); the input is
+                    # clamped to the demo state range and b to the demo still-offset range when given
+                    W = np.asarray(spec["W"], dtype=np.float64)
+                    n = W.shape[1]
+                    x = flat[:n].astype(np.float64)
+                    if "x_lo" in spec:
+                        x = np.clip(x, spec["x_lo"], spec["x_hi"])
+                    b = np.concatenate([x, np.sin(x), np.cos(x), [1.0]]) @ W
+                    if "b_lo" in spec:
+                        b = np.clip(b, spec["b_lo"], spec["b_hi"])
+                else:
+                    b = np.asarray(spec["b"], dtype=np.float64)
+                flat[: len(b)] -= b.astype(np.float32)
+                state[k] = v
+        return {**raw_obs, "state": state}
+
+    def _take_prefix(self):
+        """{part: ndarray[d, dim]} absolute steps of the previous chunk to pin, or None."""
+        d, s = self.fm_prefix_steps, self.action_steps
+        if d <= 0 or self._cached_chunk is None:
+            return None
+        out = {}
+        for k, arr in self._cached_chunk.items():
+            if not hasattr(arr, "ndim") or arr.ndim < 2 or arr.shape[0] < s + d:
+                return None
+            out[k] = arr[s:s + d].copy()
+        return out
+
+    def _log_prefix_check(self, prefix):
+        """Debug: pinned steps reproduced exactly? and how big is the seam at step d."""
+        import numpy as np
+
+        d = self.fm_prefix_steps
+        err, seam, step = {}, {}, {}
+        for k, pre in prefix.items():
+            arr = self._cached_chunk.get(k)
+            if arr is None or arr.ndim < 2 or arr.shape[0] < d + 2:
+                continue
+            err[k] = float(np.abs(arr[:d] - pre).max())
+            seam[k] = float(np.linalg.norm(arr[d] - arr[d - 1]))
+            step[k] = float(np.median(np.linalg.norm(np.diff(arr[d:], axis=0), axis=-1)))
+        fmt = lambda m: " ".join(f"{k}={v:.4f}" for k, v in sorted(m.items()))
+        logger.info("FM prefix d=%d | max|new[:d]-prev|: %s | seam |a[d]-a[d-1]|: %s | "
+                    "median tail step: %s", d, fmt(err), fmt(seam), fmt(step))
+
+    def _log_boundary_jump(self, prev_chunk):
+        """Debug (plain receding horizon): executed jump prev[s-1] -> new[0] at the chunk boundary."""
+        import numpy as np
+
+        s = self.action_steps
+        jump, step = {}, {}
+        for k, arr in self._cached_chunk.items():
+            prev = prev_chunk.get(k)
+            if prev is None or arr.ndim < 2 or prev.ndim < 2 or prev.shape[0] < s or arr.shape[0] < 2:
+                continue
+            jump[k] = float(np.linalg.norm(arr[0] - prev[s - 1]))
+            step[k] = float(np.median(np.linalg.norm(np.diff(arr, axis=0), axis=-1)))
+        fmt = lambda m: " ".join(f"{k}={v:.4f}" for k, v in sorted(m.items()))
+        logger.info("Chunk boundary s=%d | jump |new[0]-prev[s-1]|: %s | median in-chunk step: %s",
+                    s, fmt(jump), fmt(step))
+
+    # joint-position parts whose action is relative to the measured state (lower_body: torso only)
+    _TRACK_DIMS = {"left_arm": 7, "right_arm": 7, "lower_body": 4}
+
+    def _log_tracking(self, prev_chunk, state):
+        """Debug: is the boundary jump the controller tracking lag?
+
+        lag   = |prev[s-1] - state|  last executed command vs the joint position measured now
+        start = |new[0] - state|     where the new chunk starts relative to the measurement
+        jump  = |new[0] - prev[s-1]| (executed boundary jump in plain mode)
+        cos   = cos(new[0] - prev[s-1], state - prev[s-1]): ~1 means the jump points back to the
+                measured state. With a prefix also tail = |new[d] - state|.
+        """
+        import numpy as np
+
+        s, d = self.action_steps, self.fm_prefix_steps
+        rows = []
+        for k, n in self._TRACK_DIMS.items():
+            arr, prev, st = self._cached_chunk.get(k), prev_chunk.get(k), state.get(k)
+            if arr is None or prev is None or st is None or prev.shape[0] < s:
+                continue
+            st = np.asarray(st, dtype=np.float64).reshape(-1)[:n]
+            c, n0 = prev[s - 1][:n].astype(np.float64), arr[0][:n].astype(np.float64)
+            lag, start, jv = st - c, n0 - st, n0 - c
+            cos = float(jv @ lag / (np.linalg.norm(jv) * np.linalg.norm(lag) + 1e-12))
+            row = (f"{k}: lag={np.linalg.norm(lag):.4f} start={np.linalg.norm(start):.4f} "
+                   f"jump={np.linalg.norm(jv):.4f} cos={cos:+.2f}")
+            if d > 0 and arr.shape[0] > d:
+                row += f" tail={np.linalg.norm(arr[d][:n] - st):.4f}"
+            rows.append(row)
+        logger.info("Tracking s=%d d=%d | %s", s, d, " | ".join(rows))
+        # signed offset vectors (new chunk's first generated step minus the measured state), for
+        # checking whether the offset has a consistent direction across boundaries
+        vec = {}
+        for k, n in self._TRACK_DIMS.items():
+            arr, st = self._cached_chunk.get(k), state.get(k)
+            if arr is None or st is None or arr.shape[0] <= d:
+                continue
+            st = np.asarray(st, dtype=np.float64).reshape(-1)[:n]
+            vec[k] = [round(float(x), 6) for x in (arr[d][:n] - st)]
+        logger.info("OffsetVec d=%d %s", d, json.dumps(vec))
+        sv = {k: [round(float(x), 6) for x in np.asarray(state[k], dtype=np.float64).reshape(-1)[:n]]
+              for k, n in self._TRACK_DIMS.items() if k in state}
+        logger.info("StateVec %s", json.dumps(sv))
+
+    def _ensembled_step(self):
+        """Exponentially weighted mean over the chunk predictions overlapping this step (ACT).
+
+        Called once per env step. Fresh chunks enter the buffer only on recompute steps, so the
+        number of overlapping predictions is chunk_len / action_steps (2 for 32 / 16).
+        """
+        import numpy as np
+
+        if self._chunk_step == 0:                      # a chunk was just computed: age the buffer
+            self._ens = [(age + self.action_steps, ch) for age, ch in self._ens]
+            self._ens.append([0, self._cached_chunk])
+            self._ens = [list(e) for e in self._ens]
+            self._ens = [e for e in self._ens
+                         if e[0] < min(a.shape[0] for a in e[1].values() if a.ndim >= 1)]
+        out = {}
+        parts = set().union(*[set(ch) for _, ch in self._ens]) if self._ens else set()
+        for part in parts:
+            vals, ws = [], []
+            for age, ch in self._ens:
+                arr = ch.get(part)
+                idx = age + self._chunk_step
+                if arr is None or arr.ndim < 1 or idx >= arr.shape[0]:
+                    continue
+                vals.append(arr[idx])
+                # weight by how old the prediction is *now* (ACT semantics): idx == age in steps,
+                # so an older chunk's contribution also decays as we move through the segment
+                ws.append(math.exp(-self.ensemble_m * idx))
+            if not vals:
+                continue
+            if part in self.ensemble_exclude:
+                out[part] = vals[0]                    # newest prediction, never averaged
+            else:
+                w = np.asarray(ws, dtype=np.float64)
+                out[part] = np.average(np.stack(vals, axis=0), axis=0,
+                                       weights=w).astype(vals[0].dtype)
+        self._chunk_step += 1
+        return out
+
+
+        self._ens = [(age + 1, ch) for age, ch in self._ens]           # every kept chunk ages by 1
+        self._ens.append((0, self._cached_chunk))                       # the chunk just computed
+        self._ens = [(age, ch) for age, ch in self._ens
+                     if age < min(arr.shape[0] for arr in ch.values() if arr.ndim >= 1)]
+        out = {}
+        parts = set().union(*[set(ch) for _, ch in self._ens])
+        for part in parts:
+            vals, ws = [], []
+            for age, ch in self._ens:
+                arr = ch.get(part)
+                if arr is None or arr.ndim < 1 or age >= arr.shape[0]:
+                    continue
+                vals.append(arr[age])
+                ws.append(math.exp(-self.ensemble_m * age))
+            if vals:
+                w = np.asarray(ws, dtype=np.float64)
+                out[part] = np.average(np.stack(vals, axis=0), axis=0, weights=w).astype(vals[0].dtype)
+        self._chunk_step = self.action_steps  # force a recompute on the next call
+        return out
+
     def reset(self):
         """Invalidate cache (e.g. on episode boundary)."""
         self._cached_chunk = None
         self._chunk_step = 0
+        self._ens = []
 
 
 async def handler(ws, inferencer, processor, action_steps=16):

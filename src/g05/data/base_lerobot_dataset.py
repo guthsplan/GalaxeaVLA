@@ -97,6 +97,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         # train vs val
         val_set_proportion: float = 0.05,
         is_training_set: bool = False,
+        val_split_by_task: bool = False,   # hold out the last episodes of EVERY task, not the tail of the dataset
         # lerobot_ds_version
         lerobot_ds_version: Optional[Literal["2.1", "3.0"]] = "2.1",
         # tolerance
@@ -178,6 +179,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         self.val_set_proportion = val_set_proportion
         self.is_training_set = is_training_set
+        self.val_split_by_task = val_split_by_task
 
         # Convert meta lists to plain Python so OmegaConf ListConfig/DictConfig
         # don't leak into downstream isinstance(x, (list, tuple)) checks.
@@ -298,6 +300,54 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         else:
             self._start_idx = 0
             self._end_idx = self.multi_dataset.num_frames
+        # Stratified split: the tail of an episode-ordered dataset is a single task, so the
+        # validation metrics would only ever see that task. Per task, the last
+        # ceil(proportion * n_task_episodes) episodes (>= 1) go to validation.
+        self._sample_indices = None
+        if lerobot_ds_version == "3.0" and val_set_proportion > 1e-6 and val_split_by_task:
+            self._sample_indices = self._stratified_sample_indices(val_set_proportion)
+
+    def _stratified_sample_indices(self, val_set_proportion: float):
+        import math
+        from collections import defaultdict
+
+        ep_task = []
+        for ds in self.multi_dataset._datasets:
+            # v3: ds.meta.episodes is a datasets.Dataset with the meta/episodes columns
+            # (task_index, length, ...); ds.episodes is just the list of episode ids
+            eps = getattr(getattr(ds, "meta", None), "episodes", None)
+            if eps is None or isinstance(eps, list):
+                eps = getattr(ds, "episodes", None)
+            n = len(ds.episode_data_index["from"])
+            try:
+                tasks = list(eps["task_index"]) if eps is not None and not isinstance(eps, list) else None
+            except Exception:
+                tasks = None
+            if tasks is None or len(tasks) != n:
+                try:
+                    tasks = [int(eps[i]["task_index"]) for i in range(n)]
+                except Exception:
+                    logger.warning("val_split_by_task: no per-episode task_index; falling back to the tail split")
+                    return None
+            ep_task.extend(int(t) for t in tasks)
+        by_task = defaultdict(list)
+        for ep, t in enumerate(ep_task):
+            by_task[t].append(ep)
+        val_eps = set()
+        for t, eps in by_task.items():
+            k = max(1, math.ceil(len(eps) * val_set_proportion))
+            val_eps.update(eps[-k:])
+        chosen = [ep for ep in range(len(ep_task)) if (ep in val_eps) != self.is_training_set]
+        fr = self.episode_data_index["from"].numpy()
+        to = self.episode_data_index["to"].numpy()
+        idx = np.concatenate([np.arange(fr[ep], to[ep]) for ep in chosen]) if chosen else np.zeros(0, dtype=np.int64)
+        self._start_idx, self._end_idx = 0, len(idx)
+        logger.info(
+            f"val_split_by_task: {'train' if self.is_training_set else 'val'} split uses {len(chosen)} episodes / "
+            f"{len(idx)} frames; val episodes per task: "
+            f"{ {t: sum(1 for e in eps if e in val_eps) for t, eps in sorted(by_task.items())} }"
+        )
+        return idx.astype(np.int64)
 
     def _setup_meta_lerobot_keys(self):
         """Configs must provide the explicit raw layout for every meta."""
@@ -750,12 +800,12 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             return []
 
         if not self.is_training_set:
-            return list(range(self._start_idx, self._start_idx + n_samples))
+            return [int(self._to_sample_idx(i)) for i in range(n_samples)]
 
         qualified_indices = []
         skipped_unqualified = 0
 
-        for sample_idx in range(self._start_idx, self._end_idx):
+        for sample_idx in (int(self._to_sample_idx(i)) for i in range(self._end_idx - self._start_idx)):
             try:
                 lerobot_sample = self.multi_dataset[sample_idx]
             except Exception as err:
@@ -854,7 +904,13 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         Subclasses with index filtering (e.g. DroidLerobotDataset's
         _valid_local_indices) override to ensure retry stays within valid frames.
         """
-        return np.random.randint(self._start_idx, self._end_idx)
+        return int(self._to_sample_idx(np.random.randint(0, self._end_idx - self._start_idx)))
+
+    def _to_sample_idx(self, idx: int) -> int:
+        """Position in this split -> index into the underlying multi_dataset."""
+        if getattr(self, "_sample_indices", None) is not None:
+            return int(self._sample_indices[idx])
+        return int(idx + self._start_idx)
 
     def __getitem__(self, idx):
         if idx >= len(self):
@@ -864,7 +920,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         if overfit_active:
             sample_idx = int(self._overfit_indices[idx])
         else:
-            sample_idx = idx + self._start_idx
+            sample_idx = self._to_sample_idx(idx)
         attempt = 0
         last_exception: Optional[Exception] = None
         while attempt < MAX_GETITEM_ATTEMPT:

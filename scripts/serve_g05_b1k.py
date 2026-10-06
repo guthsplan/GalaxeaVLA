@@ -28,6 +28,7 @@ import http
 import json
 import logging
 import os
+import re
 import sys
 import time
 import traceback
@@ -100,17 +101,132 @@ def _to_chw(img: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
     return np.ascontiguousarray(img.transpose(2, 0, 1))
 
 
+class SubtaskFilter:
+    """Stabilise the CoT subtask stream at serving time (no retraining).
+
+    Two rules, applied to the `Subtask: ...` part of the CoT only:
+      hysteresis     a new subtask must be proposed `k` calls in a row before it is executed;
+                     until then the accepted one is teacher-forced instead.
+      no regression  a subtask already left behind in this episode is never re-accepted, which
+                     kills the `place` <-> `move back` ping-pong. Unseen subtasks always pass,
+                     so real progress is never blocked.
+
+    `done` needs `done_k` consecutive proposals, because an early `done` freezes the robot.
+    """
+
+    def __init__(self, k: int = 3, done_k: int = 8, no_regression: bool = True):
+        self.k, self.done_k, self.no_regression = k, done_k, no_regression
+        self.reset()
+
+    def reset(self):
+        self.accepted = None
+        self.history = []
+        self._cand, self._cand_n = None, 0
+        self.n_forced = 0
+        self.stats = collections.Counter()
+
+    @staticmethod
+    def _subtask(text):
+        m = re.match(r"\s*(Subtask:[^|]*)", text or "")
+        return m.group(1).strip() if m else None
+
+    def __call__(self, proposed):
+        # keep the CoT structure intact: only the part before the first '|' is the subtask,
+        # the rest ("Action: ...") must be reproduced verbatim or the action stage sees a
+        # different token sequence than in training.
+        head, sep, tail = (proposed or "").partition("|")
+        sub = head.strip()
+        if not sub.startswith("Subtask:"):
+            return proposed
+        chosen = self._decide(sub)
+        if chosen == sub:
+            return proposed
+        self.n_forced += 1
+        return f"{chosen}{sep}{tail}"
+
+    def _decide(self, sub):
+        if self.accepted is None:
+            self.accepted = sub
+            self.history.append(sub)
+            return sub
+        if sub == self.accepted:
+            self._cand, self._cand_n = None, 0
+            return sub
+        self._cand_n = self._cand_n + 1 if sub == self._cand else 1
+        self._cand = sub
+        if self.no_regression and sub in self.history and sub != self.history[-1]:
+            self.stats["blocked_regression"] += 1
+            return self.accepted
+        if self._cand_n < (self.done_k if sub.endswith("done") else self.k):
+            self.stats["blocked_hysteresis"] += 1
+            return self.accepted
+        self.accepted = sub
+        self.history.append(sub)
+        self._cand, self._cand_n = None, 0
+        self.stats["switch"] += 1
+        return sub
+
+
+def _load_proprio_bias():
+    """PROPRIO_BIAS=<json written by tools/fit_proprio_bias.py>; unset = off."""
+    path = os.environ.get("PROPRIO_BIAS")
+    if not path:
+        return None
+    with open(path) as f:
+        cfg = json.load(f)
+    # constant {"bias": {part: [b..]}}, posture-dependent {"W": {part: [[..]] (3n+1 x n)}}, or both
+    # (posture parts may carry x_lo/x_hi input clamps and b_lo/b_hi output clips)
+    spec = {k: {"b": v} for k, v in cfg.get("bias", {}).items()}
+    for k, W in cfg.get("W", {}).items():
+        spec[k] = {"W": W, **{c: cfg[c][k] for c in ("x_lo", "x_hi", "b_lo", "b_hi") if k in cfg.get(c, {})}}
+    return spec
+
+
 class G05B1KPolicy:
     def __init__(self, inferencer, processor, task_text: str, action_steps: int, image_hw: dict):
         self.task_text = task_text
         self.image_hw = image_hw
-        self.wrapper = sp.ChunkedPolicyWrapper(inferencer, processor, action_steps=action_steps)
+        self.cot_filter = (SubtaskFilter(k=int(os.environ["COT_FILTER_K"]),
+                                        done_k=int(os.environ.get("COT_FILTER_DONE_K", 8)),
+                                        no_regression=os.environ.get("COT_NO_REGRESSION", "1") == "1")
+                           if os.environ.get("COT_FILTER_K") else None)
+        ens_m = float(os.environ.get("ACTION_ENSEMBLE_M", 0) or 0)
+        self.wrapper = sp.ChunkedPolicyWrapper(inferencer, processor, action_steps=action_steps,
+                                               cot_filter=self.cot_filter, ensemble_m=ens_m,
+                                               fm_prefix_steps=int(os.environ.get("FM_PREFIX_STEPS", 0) or 0),
+                                               proprio_bias=_load_proprio_bias())
+        # ACTION_HYBRID_AR_PARTS="left_arm,right_arm": execute those parts from the AR decode and the rest
+        # (grippers, lower body) from the FM head. Both heads already run at serving time; the AR head of
+        # the LoRA runs almost never emits gripper tokens (no-op dropout of constant gripper chunks), so
+        # the grippers must stay on FM. Unset = pure FM.
+        hyb = {p.strip() for p in os.environ.get("ACTION_HYBRID_AR_PARTS", "").split(",") if p.strip()}
+        if hyb:
+            inferencer.hybrid_ar_parts = frozenset(hyb)
+            logger.info("Hybrid action ON: %s from the AR decode, every other part from FM", sorted(hyb))
+        if self.wrapper.proprio_bias:
+            logger.info("Proprio bias correction ON (%s): %s", os.environ.get("PROPRIO_BIAS"),
+                        {k: (f"posture W{len(v['W'])}x{len(v['W'][0])}" + (" clipped" if "b_lo" in v else "")
+                             if "W" in v else f"const |b|={sum(x * x for x in v['b']) ** 0.5:.4f}")
+                         for k, v in self.wrapper.proprio_bias.items()})
+        if self.wrapper.fm_prefix_steps > 0:
+            logger.info("FM prefix inpainting ON: d=%d pinned steps from the previous chunk, "
+                        "%d executed per chunk", self.wrapper.fm_prefix_steps, action_steps)
+        if ens_m > 0:
+            logger.info("Temporal ensembling ON: m=%.2f, recompute every %d steps, exp-weighted mean "
+                        "over overlapping chunk predictions (grippers not averaged)", ens_m, action_steps)
+        if self.cot_filter is not None:
+            logger.info("Subtask filter ON: k=%d done_k=%d no_regression=%s", self.cot_filter.k,
+                        self.cot_filter.done_k, self.cot_filter.no_regression)
         self.n_calls = 0
         self.n_infer = 0
         self.last_gripper = {"left_gripper": None, "right_gripper": None}
         self.missing_counts = collections.Counter()
 
     def reset(self):
+        if self.cot_filter is not None:
+            logger.info("subtask filter stats: forced=%d %s", self.cot_filter.n_forced,
+                        dict(self.cot_filter.stats))
+            self.cot_filter.reset()
         self.wrapper.reset()
         logger.info(f"episode reset after {self.n_calls} steps / {self.n_infer} model calls; "
                     f"held (absent) parts: {dict(self.missing_counts)}")
