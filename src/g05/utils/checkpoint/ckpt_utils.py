@@ -170,17 +170,18 @@ def _register_hydra_builtin_resolvers() -> None:
     OmegaConf.register_new_resolver(
         "now", lambda pattern, _tz="": datetime.now().strftime(pattern), replace=True
     )
-    OmegaConf.register_new_resolver(
-        "oc.env",
-        lambda key, default=None: (
-            os.environ[key]
-            if key in os.environ
-            else default
-            if default is not None
-            else (_ for _ in ()).throw(KeyError(f"Env var '{key}' not set"))
-        ),
-        replace=True,
-    )
+    _missing = object()
+
+    def _oc_env(key, default=_missing):
+        # Like Hydra's oc.env: an explicit default (also `null`, e.g. ${oc.env:B1K_RAW_DEMOS,null})
+        # is returned when the variable is unset; only a missing default raises.
+        if key in os.environ:
+            return os.environ[key]
+        if default is _missing:
+            raise KeyError(f"Env var '{key}' not set")
+        return default
+
+    OmegaConf.register_new_resolver("oc.env", _oc_env, replace=True)
 
 
 def load_config_from_run_dir(run_dir: Path, ckpt_path: str, overrides: list[str]) -> DictConfig:

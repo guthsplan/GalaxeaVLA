@@ -981,7 +981,18 @@ def finetune(cfg: DictConfig):
         tiling_evaluator = TilingEvaluator(
             eval_dataset,
             tiling_cfg,
-            annotations_root=tiling_cfg.get("annotations_root") or _ss.get("annotations_root"),
+            annotations_root=(
+                tiling_cfg.get("annotations_root")
+                or _ss.get("annotations_root")
+                or next(
+                    (
+                        v.get("skill_annotation_root")
+                        for v in (cfg.data.get("embodiment_datasets", None) or {}).values()
+                        if v.get("skill_annotation_root", None)
+                    ),
+                    None,
+                )
+            ),
             batch_size=cfg.batch_size_val,
             num_workers=dl_num_workers,
             collate_fn=action_collate_fn,

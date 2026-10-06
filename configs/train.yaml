@@ -49,7 +49,7 @@ eval_tiling:
   every: 2000             # steps; a multiple of eval_steps
   stride: 32              # = action horizon: chunks tile each val episode exactly once
   hybrid_ar_parts: [left_control, right_control]   # model parts from the AR decode (= serving ACTION_HYBRID_AR_PARTS=left_arm,right_arm; lower_body from AR froze the base in rollouts)
-  annotations_root: null  # default: skill_sampler.annotations_root
+  annotations_root: null  # default: skill_sampler.annotations_root, else data.*.skill_annotation_root
   gap_to_next: true       # unannotated gaps between skills count as the next skill
   min_cell_chunks: 3      # (skill, task) cells with fewer chunks are left out of the skill-balanced mean
 
