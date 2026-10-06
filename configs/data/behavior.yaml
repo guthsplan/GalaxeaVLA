@@ -173,6 +173,14 @@ embodiment_datasets:
     skill_balance_alpha: 1.0
     skill_weights: null
     skill_annotation_root: ${oc.env:B1K_RAW_DEMOS,null}
+    # Floor and exposure cap on the skill mass: every skill gets >= skill_balance_floor of the
+    # samples, but at most skill_max_visits expected visits per frame over the run (the cap wins).
+    # skill_run_samples defaults to max_steps x global batch (filled in by scripts/finetune.py).
+    # Recipe: skill_balance_alpha=1.0 skill_balance_floor=0.01 skill_max_visits=3. Mutually
+    # exclusive with the sampler-level skill_sampler.* (configs/train.yaml).
+    skill_balance_floor: 0.0
+    skill_max_visits: 0.0
+    skill_run_samples: null
     # Skill-expert runs (g05/data/skill_groups.py): keep only frames whose annotated skill is in
     # these groups, in BOTH splits, e.g. "grasp" or "revolute,linear". null / "all" = every frame.
     skill_groups: null

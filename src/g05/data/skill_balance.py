@@ -9,8 +9,19 @@ sampling mass of skill k is
 spread uniformly over that skill's frames. alpha = 1 with no weights is the natural
 frame distribution; alpha = 0 gives every skill the same mass; `weight_k` multiplies on top
 (e.g. "move to=0.3"). `keep_skills` zeroes every other skill (skill-expert runs, see
-g05.data.skill_groups). Frames outside every segment (leading frames before the first
-segment, gaps, a tail past the last one) take the nearest segment's skill.
+g05.data.skill_groups). Frames outside every segment take a neighbouring segment's skill: a gap
+between two segments (mostly the approach into the next skill) and the leading frames take the
+NEXT segment's skill, the tail past the last segment the last one's. This is the belief-graph
+targets' convention (bgdata.cot_targets) and the subtask labels of datasets built with
+build_b1k_bbox_trace_sidecars.py --subtask-gap next.
+
+Floor and exposure cap (applied after alpha / weights, both off by default):
+  floor f       every kept skill gets at least a share f of the samples (rare skills cannot vanish);
+                the extra comes out of the other skills in proportion to their mass.
+  max_visits c  over `run_samples` training samples (max_steps x global batch), no skill is drawn
+                more than c times per frame on average: share_k <= c * F_k / run_samples. The cap
+                wins over the floor (a skill with a handful of demos is not repeated into overfit).
+E.g. alpha=1, f=0.01, c=3 keeps the natural frame distribution but lifts skills below 1 %.
 
 Sample `idx` of `n` is drawn by stratified inverse-CDF over the cumulative mass: mass
 (idx + U) / n * total. With uniform weights this is exactly `train_frame_stride` jitter
@@ -69,19 +80,16 @@ def _episode_segments(ann: dict, length: int) -> List[tuple]:
     if not raw:
         return [(0, length, UNANNOTATED)]
     raw.sort()
-    # Clip overlaps, then hand each uncovered stretch to its neighbour (leading frames to
-    # the first segment, everything else to the segment before it).
+    # Clip overlaps, then hand each uncovered stretch to its neighbour: leading frames and gaps to
+    # the segment after them, the tail to the last segment.
     runs = []
     cursor = 0
     for b, e, skill in raw:
         b = max(b, cursor)
         if e <= b:
             continue
-        if not runs:
-            b = 0
-        elif b > cursor:
-            pb, _, ps = runs[-1]
-            runs[-1] = (pb, b, ps)
+        # leading frames and a gap before this segment belong to it (the next skill)
+        b = cursor if runs else 0
         runs.append((b, e, skill))
         cursor = e
     pb, _, ps = runs[-1]
@@ -139,6 +147,41 @@ def skill_val_episodes(
     return val
 
 
+def apply_floor_cap(share: np.ndarray, frames: np.ndarray, floor: float = 0.0, max_visits: float = 0.0,
+                    run_samples: Optional[int] = None, eligible: Optional[np.ndarray] = None) -> np.ndarray:
+    """Shares (sum 1) with a per-skill floor and an exposure cap, by iterative water-filling.
+
+    share: base shares of the kept skills (0 for dropped ones); frames: their frame counts.
+    floor: minimum share of every eligible skill; max_visits / run_samples: share_k is capped at
+    max_visits * frames_k / run_samples. Skills pinned at a bound keep it, the rest share the
+    remainder in proportion to their base share. The cap wins over the floor.
+    """
+    p = np.asarray(share, dtype=np.float64)
+    live = p > 0
+    elig = live if eligible is None else (live & np.asarray(eligible, dtype=bool))
+    upper = np.full(len(p), np.inf)
+    if max_visits > 0 and run_samples:
+        upper = np.where(live, max_visits * np.asarray(frames, dtype=np.float64) / float(run_samples), np.inf)
+    lower = np.where(elig, min(float(floor), 1.0 / max(1, int(elig.sum()))), 0.0)
+    lower = np.minimum(lower, upper)
+    q = p / p.sum()
+    pinned = np.zeros(len(p), dtype=bool)
+    for _ in range(len(p) + 1):
+        free = live & ~pinned
+        rest = 1.0 - q[pinned].sum()
+        if free.any() and p[free].sum() > 0:
+            q[free] = p[free] / p[free].sum() * rest
+        low, high = free & (q < lower), free & (q > upper)
+        if not (low.any() or high.any()):
+            break
+        q[low], q[high] = lower[low], upper[high]
+        pinned |= low | high
+    if abs(q.sum() - 1.0) > 1e-9:  # every skill pinned: bounds infeasible, keep the proportions
+        logger.warning(f"[skill-balance] floor/cap bounds are infeasible (sum {q.sum():.3f}); renormalizing")
+        q = q / q.sum()
+    return q
+
+
 class SkillBalancedIndex:
     """Maps sample index -> global frame index with per-skill sampling mass."""
 
@@ -155,6 +198,9 @@ class SkillBalancedIndex:
         annotation_root: Optional[str] = None,
         keep_skills: Optional[Sequence[str]] = None,
         episodes: Optional[Collection[int]] = None,
+        floor: float = 0.0,
+        max_visits: float = 0.0,
+        run_samples: Optional[int] = None,
     ):
         """`episodes`: global episode indices to draw from (default: every episode in range)."""
         if alpha < 0:
@@ -222,6 +268,12 @@ class SkillBalancedIndex:
         if mass.sum() <= 0:
             raise ValueError("skill_weights zero out every skill")
         mass /= mass.sum()
+        if floor > 0 or max_visits > 0:
+            if max_visits > 0 and not run_samples:
+                logger.warning("[skill-balance] skill_max_visits needs skill_run_samples (max_steps x global "
+                               "batch); the exposure cap is off")
+            mass = apply_floor_cap(mass, frames_per_skill, floor, max_visits, run_samples,
+                                   eligible=np.asarray([s != UNANNOTATED for s in skills]))
         per_frame = mass / frames_per_skill  # sampling density of one frame of each skill
 
         keep = per_frame[sid] > 0
@@ -241,7 +293,8 @@ class SkillBalancedIndex:
                 f"{mass[k] * 100:>10.2f}{mass[k] / share[k]:>7.2f}"
             )
         logger.info(
-            f"[skill-balance] alpha={alpha}, weights={skill_weights or {}}, "
+            f"[skill-balance] alpha={alpha}, floor={floor}, max_visits={max_visits}, run_samples={run_samples}, "
+            f"weights={skill_weights or {}}, "
             f"keep={sorted(keep_skills) if keep_skills is not None else 'all'}, {len(lo)} runs, "
             f"{self.num_samples} samples/epoch\n" + "\n".join(lines)
         )

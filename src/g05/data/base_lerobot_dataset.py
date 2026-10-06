@@ -115,6 +115,12 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         skill_balance_alpha: float = 1.0,
         skill_weights: Union[None, str, Dict[str, float]] = None,
         skill_annotation_root: Optional[str] = None,
+        # floor / exposure cap on top of the skill mass (g05.data.skill_balance): every kept skill gets at
+        # least `skill_balance_floor` of the samples, and no skill more than `skill_max_visits` expected
+        # visits per frame over `skill_run_samples` training samples (the cap wins over the floor).
+        skill_balance_floor: float = 0.0,
+        skill_max_visits: float = 0.0,
+        skill_run_samples: Optional[int] = None,
         # skill-expert runs (g05.data.skill_groups): keep only frames whose annotated skill is in
         # these groups, e.g. "grasp,place"; applies to the validation split too. null / "all" = off
         skill_groups: Union[None, str, List[str]] = None,
@@ -372,7 +378,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         skill_weights = parse_skill_weights(_to_plain(skill_weights))
         groups = parse_groups(_to_plain(skill_groups))
         keep_skills = skills_of(groups) if groups and groups != [ALL] else None
-        balance = self.is_training_set and (float(skill_balance_alpha) != 1.0 or bool(skill_weights))
+        balance = self.is_training_set and (
+            float(skill_balance_alpha) != 1.0 or bool(skill_weights) or float(skill_balance_floor) > 0
+            or float(skill_max_visits) > 0
+        )
         split_episodes = None
         index_lo, index_hi = self._start_idx, self._end_idx
         if int(skill_val_episodes_per_task) > 0 and keep_skills is not None:
@@ -405,6 +414,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 episodes=split_episodes,
                 alpha=float(skill_balance_alpha) if balance else 1.0,
                 skill_weights=skill_weights if balance else {},
+                floor=float(skill_balance_floor) if balance else 0.0,
+                max_visits=float(skill_max_visits) if balance else 0.0,
+                run_samples=skill_run_samples,
                 annotation_root=skill_annotation_root,
                 keep_skills=keep_skills,
             )

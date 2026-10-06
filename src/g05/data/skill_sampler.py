@@ -342,6 +342,9 @@ def train_frame_indices(train_dataset):
         ds = ds.datasets[0]
     if getattr(ds, "is_rank_sharded", False) or hasattr(ds, "_overfit_indices"):
         raise ValueError("skill sampler: rank-sharded or overfit datasets are not supported")
+    if getattr(ds, "_skill_index", None) is not None or getattr(ds, "train_frame_stride", 1) > 1:
+        raise ValueError("skill sampler: the dataset already remaps indices (skill_balance_* / skill_groups / "
+                         "train_frame_stride); use one of the two")
     inner = getattr(getattr(ds, "multi_dataset", None), "_datasets", None)
     if inner is not None and len(inner) != 1:
         raise ValueError(f"skill sampler: dataset group with {len(inner)} LeRobot dirs is not supported")

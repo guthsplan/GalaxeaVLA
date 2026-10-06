@@ -654,6 +654,21 @@ def finetune(cfg: DictConfig):
         if hasattr(model, "action_tokenizer"):
             model.action_tokenizer.to(device_id)
 
+    # Skill-balance exposure cap (g05.data.skill_balance): visits per frame are counted over the whole
+    # run, so the dataset needs the run's sample count, max_steps x global batch.
+    _emb_cfgs = cfg.data.get("embodiment_datasets", None) or {}
+    for _name in list(_emb_cfgs.keys()):
+        _ds_cfg = _emb_cfgs[_name]
+        if float(_ds_cfg.get("skill_max_visits", 0) or 0) > 0 and not _ds_cfg.get("skill_run_samples", None):
+            if cfg.model.get("max_steps", None):
+                _run = int(cfg.model.max_steps) * int(cfg.model.batch_size) * int(accelerator.num_processes) \
+                    * int(cfg.model.grad_accumulation_steps)
+                OmegaConf.set_struct(_ds_cfg, False)
+                _ds_cfg.skill_run_samples = _run
+                logger.info(f"[skill-balance] {_name}: skill_run_samples = {_run:,} (max_steps x global batch)")
+            else:
+                logger.warning(f"[skill-balance] {_name}: skill_max_visits needs model.max_steps; cap off")
+
     with accelerator.main_process_first():
         logger.info(f"[Process {accelerator.process_index}] Loading dataset...")
         train_dataset = instantiate_dataset(cfg, is_training_set=True)
@@ -835,6 +850,13 @@ def finetune(cfg: DictConfig):
         from g05.data.skill_sampler import build_skill_sampler
 
         assert overfit_batch is None, "skill_sampler and overfit_batch are mutually exclusive"
+        # The dataset-level skill balance / skill-group filter / frame stride remap sample indices;
+        # combined with this sampler the skill mix would be balanced twice.
+        _inner = train_dataset.datasets if isinstance(train_dataset, MixtureLerobotDataset) else [train_dataset]
+        if any(getattr(d, "_skill_index", None) is not None or getattr(d, "train_frame_stride", 1) > 1
+               for d in _inner):
+            raise ValueError("skill_sampler.enabled cannot be combined with the dataset's skill_balance_* / "
+                             "skill_groups / train_frame_stride options; use one of the two")
         train_sampler = build_skill_sampler(
             skill_sampler_cfg,
             train_dataset,

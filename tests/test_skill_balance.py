@@ -6,7 +6,7 @@ import types
 import numpy as np
 import pytest
 
-from g05.data.skill_balance import SkillBalancedIndex, _episode_segments, parse_skill_weights
+from g05.data.skill_balance import SkillBalancedIndex, _episode_segments, apply_floor_cap, parse_skill_weights
 
 
 def _ann(*segs):
@@ -22,8 +22,8 @@ def test_parse_skill_weights():
 
 
 def test_segments_fill_gaps_and_split_intervals():
-    # leading frames -> first segment, gap -> previous segment, tail -> last segment
-    assert _episode_segments(_ann(("a", [5, 10]), ("b", [12, 20])), 25) == [(0, 12, "a"), (12, 25, "b")]
+    # leading frames -> first segment, gap -> next segment, tail -> last segment
+    assert _episode_segments(_ann(("a", [5, 10]), ("b", [12, 20])), 25) == [(0, 10, "a"), (10, 25, "b")]
     # an interrupted segment is a list of intervals
     assert _episode_segments(_ann(("m", [[0, 4], [6, 8]]), ("p", [4, 6])), 8) == [
         (0, 4, "m"), (4, 6, "p"), (6, 8, "m")]
@@ -113,3 +113,39 @@ def test_per_task_val_split(tmp_path):
     vf = {vidx(i) // 100 for i in range(100)}
     assert tf == {0, 3, 4} and vf == {1, 5}
     assert all(train.skill_of(train(i)) == "chop" for i in range(500))
+
+
+def test_floor_lifts_rare_skills_and_takes_proportionally():
+    frames = np.array([900.0, 95.0, 5.0])
+    q = apply_floor_cap(frames / frames.sum(), frames, floor=0.05)
+    assert q.sum() == pytest.approx(1.0)
+    assert q[2] == pytest.approx(0.05)                       # 0.5 % -> floor
+    assert q[0] / q[1] == pytest.approx(900 / 95)            # the others keep their ratio
+
+
+def test_cap_wins_over_floor():
+    frames = np.array([900.0, 95.0, 5.0])
+    # 1000 samples over the run, at most 3 visits per frame: skill 2 may take 15 samples = 1.5 %
+    q = apply_floor_cap(frames / frames.sum(), frames, floor=0.05, max_visits=3, run_samples=1000)
+    assert q[2] == pytest.approx(0.015)
+    assert q.sum() == pytest.approx(1.0)
+    # without a run length the cap is off
+    q = apply_floor_cap(frames / frames.sum(), frames, floor=0.05, max_visits=3, run_samples=None)
+    assert q[2] == pytest.approx(0.05)
+
+
+def test_floor_and_cap_in_index(tmp_path):
+    # natural: move to 70 %, pick 30 %; floor 0.4 lifts pick to 40 %
+    paths = []
+    for i, segs in enumerate([[("move to", [0, 900]), ("pick", [900, 1000])],
+                              [("move to", [0, 500]), ("pick", [500, 1000])]]):
+        rel = f"annotations/ep{i}.json"
+        (tmp_path / "annotations").mkdir(exist_ok=True)
+        (tmp_path / rel).write_text(json.dumps(_ann(*segs)))
+        paths.append(rel)
+    ds = types.SimpleNamespace(meta=types.SimpleNamespace(episodes=_Cols({"annotation_path": paths})), root=str(tmp_path))
+    idx = SkillBalancedIndex([ds], [0, 1000], [1000, 2000], 0, 2000, 200, 1.0, {}, floor=0.4)
+    assert idx.summary["pick"][1] == pytest.approx(0.4)
+    idx = SkillBalancedIndex([ds], [0, 1000], [1000, 2000], 0, 2000, 200, 1.0, {}, floor=0.4,
+                             max_visits=1, run_samples=2000)   # pick: 600 frames -> <= 30 %
+    assert idx.summary["pick"][1] == pytest.approx(0.3)
