@@ -71,6 +71,7 @@ from utils.metric import resolve_parts_meta
 from utils.preflight import build_filter_str, run_preflight_checks
 from utils.eval_snapshot import save_train_snapshot
 from utils.train_eval import PeriodicEvaluator
+from utils.tiling_eval import TilingEvaluator
 
 register_default_resolvers()
 
@@ -793,14 +794,30 @@ def finetune(cfg: DictConfig):
     sampler_num_replicas = accelerator.num_processes
     sampler_rank = accelerator.process_index
     overfit_shuffle = overfit_batch is None
-    train_sampler = ResumableDistributedSampler(
-        train_dataset,
-        num_replicas=sampler_num_replicas,
-        rank=sampler_rank,
-        seed=cfg.seed,
-        shuffle=overfit_shuffle,
-        batch_size=cfg.model.batch_size,
-    )
+    skill_sampler_cfg = cfg.get("skill_sampler", None)
+    if skill_sampler_cfg is not None and skill_sampler_cfg.get("enabled", False):
+        # Skill-balanced start frames (g05/data/skill_sampler.py); the per-rank stream resumes from
+        # (epoch, action_batch_idx) like ResumableDistributedSampler.
+        from g05.data.skill_sampler import build_skill_sampler
+
+        assert overfit_batch is None, "skill_sampler and overfit_batch are mutually exclusive"
+        train_sampler = build_skill_sampler(
+            skill_sampler_cfg,
+            train_dataset,
+            batch_size=cfg.model.batch_size,
+            num_replicas=sampler_num_replicas,
+            rank=sampler_rank,
+            seed=cfg.seed,
+        )
+    else:
+        train_sampler = ResumableDistributedSampler(
+            train_dataset,
+            num_replicas=sampler_num_replicas,
+            rank=sampler_rank,
+            seed=cfg.seed,
+            shuffle=overfit_shuffle,
+            batch_size=cfg.model.batch_size,
+        )
     eval_sampler = DistributedSampler(
         eval_dataset,
         num_replicas=sampler_num_replicas,
@@ -854,6 +871,29 @@ def finetune(cfg: DictConfig):
         output_dir=output_dir,
         num_batches=int(cfg.get("eval_num_batches", 1)),
     )
+
+    # Fixed full-coverage validation (utils/tiling_eval.py) for best-checkpoint selection; runs inside the
+    # periodic eval every eval_tiling.every steps (a multiple of eval_steps).
+    tiling_evaluator = None
+    tiling_cfg = cfg.get("eval_tiling", None)
+    if tiling_cfg is not None and tiling_cfg.get("enabled", False):
+        assert int(tiling_cfg.every) % int(cfg.eval_steps) == 0, "eval_tiling.every must be a multiple of eval_steps"
+        _ss = cfg.get("skill_sampler", None) or {}
+        tiling_evaluator = TilingEvaluator(
+            eval_dataset,
+            tiling_cfg,
+            annotations_root=tiling_cfg.get("annotations_root") or _ss.get("annotations_root"),
+            batch_size=cfg.batch_size_val,
+            num_workers=dl_num_workers,
+            collate_fn=action_collate_fn,
+            worker_init_fn=worker_init_fn,
+            processor=eval_processor,
+            parts_meta=eval_parts_meta,
+            output_dir=output_dir,
+            rank=sampler_rank,
+            world_size=sampler_num_replicas,
+            seed=cfg.seed,
+        )
 
     if overfit_batch is not None:
         logger.info(
@@ -1297,6 +1337,10 @@ def finetune(cfg: DictConfig):
                                 eval_batch=eval_batch,
                             )
                             _eval_time = eval_log_dict.pop("_eval_time_sec", 0.0)
+                            if tiling_evaluator is not None and step % int(tiling_cfg.every) == 0:
+                                _tiling = tiling_evaluator.evaluate(unwrap_model(model), accelerator, step)
+                                _eval_time += _tiling.pop("_eval_time_sec", 0.0)
+                                eval_log_dict.update(_tiling)
                             log_dict.update(eval_log_dict)
                             # Best-metric checkpoint (inference-only) whenever the tracked eval metric
                             # improves; the metric name comes from cfg.best_metric (default: AR action

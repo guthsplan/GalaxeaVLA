@@ -22,6 +22,9 @@ Inputs (all under the challenge demos root, $B1K_RAW_DEMOS)
     Subtask text per skill segment, rendered with the same templates the belief-graph
     pipeline uses (bgdata.operators.TEXT via bgdata.cot_targets.subtask_text), so the text is
     identical with or without belief-graph labels. Frames after the last segment: "done".
+    Unannotated frames between two skills keep the previous skill (default) or, with
+    ``--subtask-gap next``, get the next skill -- the belief-graph targets' own convention
+    (bgdata.cot_targets: "in a gap the target is the NEXT skill").
 
 Frames where neither hand is visible get no trace label (Trace2DCoTBuilder.can_handle would
 reject them anyway).
@@ -131,8 +134,12 @@ def _subtask_text(seg: dict, ops: dict) -> str:
     return " ".join([seg["skill"], *objs])
 
 
-def subtask_rows(root: Path, task: int, raw_id: int, length: int) -> Tuple[List[dict], Optional[str]]:
-    """Segment-start rows (episode, frame, subtask) from the skill annotation."""
+def subtask_rows(root: Path, task: int, raw_id: int, length: int,
+                 gap: str = "prev") -> Tuple[List[dict], Optional[str]]:
+    """Segment-start rows (episode, frame, subtask) from the skill annotation.
+
+    The merge fills each row forward to the next one, so an unannotated gap between two skills
+    takes the previous skill's text; gap="next" moves the next skill's row back to the gap start."""
     from bgdata.operators import OP_ARGS, TEXT
 
     path = root / "annotations" / f"task-{task:04d}" / f"episode_{raw_id:08d}.json"
@@ -141,15 +148,24 @@ def subtask_rows(root: Path, task: int, raw_id: int, length: int) -> Tuple[List[
     ops = {op: {"args": args, "text": TEXT[op]} for op, args in OP_ARGS.items()}
     rows: List[dict] = []
     last_end = 0
-    for seg in _skill_segments(json.loads(path.read_text())):
-        if not 0 <= seg["start"] < length:
-            continue
+    segs = [seg for seg in _skill_segments(json.loads(path.read_text())) if 0 <= seg["start"] < length]
+    for seg in segs:
         text = _subtask_text(seg, ops)
         if rows and rows[-1]["frame"] == seg["start"]:
             rows[-1]["subtask"] = text  # two segments starting on one frame: the later wins
         else:
             rows.append({"episode": raw_id, "frame": seg["start"], "subtask": text})
         last_end = max(last_end, seg["end"])
+    if gap == "next" and rows:
+        covered = np.zeros(length, dtype=bool)
+        for seg in segs:
+            covered[seg["start"]:min(seg["end"], length)] = True
+        first = rows[0]["frame"]
+        for row in rows[1:]:
+            f = row["frame"]
+            while f > first and not covered[f - 1]:  # walk back over the unannotated gap
+                f -= 1
+            row["frame"] = f
     if rows and last_end < length:
         rows.append({"episode": raw_id, "frame": last_end, "subtask": "done"})
     return rows, None if rows else "empty"
@@ -294,6 +310,8 @@ def main() -> int:
     ap.add_argument("--bbox-dir", type=Path, help=f"default <demos-root>/{BBOX_DIR}")
     ap.add_argument("--trace-dir", type=Path, help=f"default <demos-root>/{TRACE_DIR}")
     ap.add_argument("--no-subtask", action="store_true")
+    ap.add_argument("--subtask-gap", default="prev", choices=["prev", "next"],
+                    help="label of unannotated frames between two skills (next = belief-graph convention)")
     ap.add_argument("--no-bbox", action="store_true")
     ap.add_argument("--no-trace", action="store_true")
     ap.add_argument("--bbox-key", default="bbox", choices=["bbox", "raw_bbox"])
@@ -325,7 +343,7 @@ def main() -> int:
             records: Dict[int, Dict[str, dict]] = defaultdict(dict)
 
             if not args.no_subtask:
-                rows, reason = subtask_rows(root, task, raw_id, length)
+                rows, reason = subtask_rows(root, task, raw_id, length, gap=args.subtask_gap)
                 if reason:
                     skips[f"subtask:{reason}"].append(raw_id)
                 else:

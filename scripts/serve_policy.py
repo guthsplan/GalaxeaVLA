@@ -405,6 +405,13 @@ class ChunkedPolicyWrapper:
             actions = await asyncio.to_thread(self.inferencer.infer, [obs_dict])
             action = actions[0]
             self._cot_text = action.pop("_cot_text", None)
+            hyb_used = action.pop("_hybrid_ar_parts", None)
+            if hyb_used is not None:
+                self.hybrid_calls = getattr(self, "hybrid_calls", 0) + 1
+                self.hybrid_ar_used = getattr(self, "hybrid_ar_used", 0) + (1 if hyb_used else 0)
+                if self.hybrid_calls % 50 == 1:
+                    logger.info("Hybrid action: AR parts %s used (%d/%d calls had an AR part)",
+                                hyb_used, self.hybrid_ar_used, self.hybrid_calls)
             if self.cot_filter is not None and self._cot_text:
                 keep = self.cot_filter(self._cot_text)
                 if keep and keep != self._cot_text:
@@ -412,6 +419,7 @@ class ChunkedPolicyWrapper:
                     actions = await asyncio.to_thread(self.inferencer.infer, [obs_dict])
                     action = actions[0]
                     action.pop("_cot_text", None)
+                    action.pop("_hybrid_ar_parts", None)
                     self._cot_text = keep
             # Drop keys the AR head did not confidently predict. The protocol
             # returns only predicted keys; each client fills/holds missing keys

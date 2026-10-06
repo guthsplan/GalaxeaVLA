@@ -195,6 +195,14 @@ class G05B1KPolicy:
                                                cot_filter=self.cot_filter, ensemble_m=ens_m,
                                                fm_prefix_steps=int(os.environ.get("FM_PREFIX_STEPS", 0) or 0),
                                                proprio_bias=_load_proprio_bias())
+        # ACTION_HYBRID_AR_PARTS="left_arm,right_arm": execute those parts from the AR decode and the rest
+        # (grippers, lower body) from the FM head. Both heads already run at serving time; the AR head of
+        # the LoRA runs almost never emits gripper tokens (no-op dropout of constant gripper chunks), so
+        # the grippers must stay on FM. Unset = pure FM.
+        hyb = {p.strip() for p in os.environ.get("ACTION_HYBRID_AR_PARTS", "").split(",") if p.strip()}
+        if hyb:
+            inferencer.hybrid_ar_parts = frozenset(hyb)
+            logger.info("Hybrid action ON: %s from the AR decode, every other part from FM", sorted(hyb))
         if self.wrapper.proprio_bias:
             logger.info("Proprio bias correction ON (%s): %s", os.environ.get("PROPRIO_BIAS"),
                         {k: (f"posture W{len(v['W'])}x{len(v['W'][0])}" + (" clipped" if "b_lo" in v else "")

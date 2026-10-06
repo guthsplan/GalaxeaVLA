@@ -49,6 +49,10 @@ def resolve_processor(processor, data):
 class PolicyInferencer:
     """Unified inference wrapper: obs_dicts in → action dicts out."""
 
+    # Action parts taken from the AR decode instead of the FM head when both heads run (serving
+    # option ACTION_HYBRID_AR_PARTS, e.g. {"left_arm", "right_arm"}); empty = pure FM.
+    hybrid_ar_parts: frozenset = frozenset()
+
     def __init__(self, policy, processor, device: str = "cuda"):
         self.policy = policy
         self.processor = processor
@@ -83,7 +87,8 @@ class PolicyInferencer:
         cot_texts = batch.get("cot_text")
         results = []
         for i, p in enumerate(prepared):
-            action = self._postprocess_single(batch, index=i, sub_processor=p.sub_processor)
+            action = self._postprocess_single(batch, index=i, sub_processor=p.sub_processor,
+                                              hybrid_ar_parts=self.hybrid_ar_parts)
             if cot_texts is not None:
                 action["_cot_text"] = cot_texts[i]
             results.append(action)
@@ -152,8 +157,13 @@ class PolicyInferencer:
         return collated
 
     @staticmethod
-    def _postprocess_single(batch: dict, index: int, sub_processor) -> dict:
-        """Slice one sample from a batched model output and postprocess it."""
+    def _postprocess_single(batch: dict, index: int, sub_processor, hybrid_ar_parts=frozenset()) -> dict:
+        """Slice one sample from a batched model output and postprocess it.
+
+        hybrid_ar_parts: with an FM action and an AR decode in the same batch, these parts are taken
+        from the AR decode (postprocessed the same way) and the rest from FM. A part the AR decode
+        did not emit (ar_absent_keys) keeps its FM value.
+        """
         item_batch = {
             "action": batch["action"][index : index + 1],
             "proprio": batch["proprio"][index : index + 1],
@@ -164,7 +174,20 @@ class PolicyInferencer:
             item_batch["proprio_dim_is_pad"] = batch["proprio_dim_is_pad"][index : index + 1]
         if "action_op_mask" in batch:
             item_batch["action_op_mask"] = batch["action_op_mask"][index : index + 1]
+        hybrid = bool(hybrid_ar_parts) and batch.get("action_source") == "fm" and batch.get("ar_action") is not None
+        if hybrid:  # postprocess() mutates its input, so copy before the FM pass
+            ar_item = {**item_batch, "action": batch["ar_action"][index : index + 1].to(item_batch["action"].dtype)}
         action = sub_processor.postprocess(item_batch)["action"]
+        if hybrid:
+            ar_action = sub_processor.postprocess(ar_item)["action"]
+            ar_absent_all = batch.get("ar_absent_keys")
+            ar_absent = ar_absent_all[index] if ar_absent_all is not None and index < len(ar_absent_all) else set()
+            used = []
+            for k in hybrid_ar_parts:
+                if k in ar_action and k in action and k not in ar_absent:
+                    action[k] = ar_action[k]
+                    used.append(k)
+            action["_hybrid_ar_parts"] = sorted(used)
         # ar_absent_keys are parts the AR decode did not emit (e.g. a gripper group removed by
         # no-op dropout). They only describe the executed action when that action IS the AR
         # decode; the FM head always predicts every dimension, so dropping them from an FM

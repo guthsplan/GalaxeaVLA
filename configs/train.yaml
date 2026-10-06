@@ -24,6 +24,30 @@ eval_steps: 100
 eval_num_batches: 1   # validation batches averaged per periodic eval (each rank draws its own)
 best_metric: eval/action/rollout/ar_action_acc   # eval metric that selects checkpoints/best.pt
 best_metric_mode: max   # max: higher is better (accuracy); min: lower is better (e.g. eval/action/rollout/fm_action_l1)
+# Skill-balanced start-frame sampling (src/g05/data/skill_sampler.py) instead of uniform shuffling of frames.
+# Needs meta/episodes raw_episode_id and <annotations_root>/annotations/task-XXXX/episode_*.json (outside the
+# dataset dir: the LeRobot loader reads <dataset>/annotations as subtask annotations).
+skill_sampler:
+  enabled: false
+  B: null                 # samples per local epoch
+  s_max: null             # stride cap (global epoch = G <= s_max local epochs)
+  alpha: 0.5              # skill temperature: w_s ~ frames_s^alpha
+  annotations_root: null  # required, e.g. the challenge demos root
+  start_margin: 0         # forbid starts in the last N frames of a segment (e.g. action_horizon - 1)
+  min_skill_frames: 0     # drop skills with fewer total frames
+  gap_to_next: true       # unannotated frames between two skills join the next skill's segment
+  steps_per_epoch: null   # dataloader epoch length in steps; default ceil(B / global batch)
+
+# Fixed full-coverage validation for checkpoint selection (scripts/utils/tiling_eval.py): the chunks starting
+# every `stride` frames of every val episode, scored per skill; e.g. best_metric=eval/tiling/skill_balanced_hybrid_l1 best_metric_mode=min
+eval_tiling:
+  enabled: false
+  every: 2000             # steps; a multiple of eval_steps
+  stride: 32              # = action horizon: chunks tile each val episode exactly once
+  hybrid_ar_parts: [left_control, right_control]   # model parts from the AR decode (= serving ACTION_HYBRID_AR_PARTS=left_arm,right_arm; lower_body from AR froze the base in rollouts)
+  annotations_root: null  # default: skill_sampler.annotations_root
+  gap_to_next: true       # unannotated gaps between skills count as the next skill
+  min_cell_chunks: 3      # (skill, task) cells with fewer chunks are left out of the skill-balanced mean
 
 # logger configuration - supports swanlab, wandb, or none
 logger:
