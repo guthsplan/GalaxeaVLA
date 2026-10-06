@@ -331,49 +331,6 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         if lerobot_ds_version == "3.0" and val_set_proportion > 1e-6 and val_split_by_task:
             self._sample_indices = self._stratified_sample_indices(val_set_proportion)
 
-    def _stratified_sample_indices(self, val_set_proportion: float):
-        import math
-        from collections import defaultdict
-
-        ep_task = []
-        for ds in self.multi_dataset._datasets:
-            # v3: ds.meta.episodes is a datasets.Dataset with the meta/episodes columns
-            # (task_index, length, ...); ds.episodes is just the list of episode ids
-            eps = getattr(getattr(ds, "meta", None), "episodes", None)
-            if eps is None or isinstance(eps, list):
-                eps = getattr(ds, "episodes", None)
-            n = len(ds.episode_data_index["from"])
-            try:
-                tasks = list(eps["task_index"]) if eps is not None and not isinstance(eps, list) else None
-            except Exception:
-                tasks = None
-            if tasks is None or len(tasks) != n:
-                try:
-                    tasks = [int(eps[i]["task_index"]) for i in range(n)]
-                except Exception:
-                    logger.warning("val_split_by_task: no per-episode task_index; falling back to the tail split")
-                    return None
-            ep_task.extend(int(t) for t in tasks)
-        by_task = defaultdict(list)
-        for ep, t in enumerate(ep_task):
-            by_task[t].append(ep)
-        val_eps = set()
-        for t, eps in by_task.items():
-            k = max(1, math.ceil(len(eps) * val_set_proportion))
-            val_eps.update(eps[-k:])
-        chosen = [ep for ep in range(len(ep_task)) if (ep in val_eps) != self.is_training_set]
-        self._split_episodes = set(chosen)  # frame-space split for SkillBalancedIndex
-        fr = self.episode_data_index["from"].numpy()
-        to = self.episode_data_index["to"].numpy()
-        idx = np.concatenate([np.arange(fr[ep], to[ep]) for ep in chosen]) if chosen else np.zeros(0, dtype=np.int64)
-        self._start_idx, self._end_idx = 0, len(idx)
-        logger.info(
-            f"val_split_by_task: {'train' if self.is_training_set else 'val'} split uses {len(chosen)} episodes / "
-            f"{len(idx)} frames; val episodes per task: "
-            f"{ {t: sum(1 for e in eps if e in val_eps) for t, eps in sorted(by_task.items())} }"
-        )
-        return idx.astype(np.int64)
-
         self._skill_index = None
         skill_weights = parse_skill_weights(_to_plain(skill_weights))
         groups = parse_groups(_to_plain(skill_groups))
@@ -420,6 +377,50 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 annotation_root=skill_annotation_root,
                 keep_skills=keep_skills,
             )
+
+
+    def _stratified_sample_indices(self, val_set_proportion: float):
+        import math
+        from collections import defaultdict
+
+        ep_task = []
+        for ds in self.multi_dataset._datasets:
+            # v3: ds.meta.episodes is a datasets.Dataset with the meta/episodes columns
+            # (task_index, length, ...); ds.episodes is just the list of episode ids
+            eps = getattr(getattr(ds, "meta", None), "episodes", None)
+            if eps is None or isinstance(eps, list):
+                eps = getattr(ds, "episodes", None)
+            n = len(ds.episode_data_index["from"])
+            try:
+                tasks = list(eps["task_index"]) if eps is not None and not isinstance(eps, list) else None
+            except Exception:
+                tasks = None
+            if tasks is None or len(tasks) != n:
+                try:
+                    tasks = [int(eps[i]["task_index"]) for i in range(n)]
+                except Exception:
+                    logger.warning("val_split_by_task: no per-episode task_index; falling back to the tail split")
+                    return None
+            ep_task.extend(int(t) for t in tasks)
+        by_task = defaultdict(list)
+        for ep, t in enumerate(ep_task):
+            by_task[t].append(ep)
+        val_eps = set()
+        for t, eps in by_task.items():
+            k = max(1, math.ceil(len(eps) * val_set_proportion))
+            val_eps.update(eps[-k:])
+        chosen = [ep for ep in range(len(ep_task)) if (ep in val_eps) != self.is_training_set]
+        self._split_episodes = set(chosen)  # frame-space split for SkillBalancedIndex
+        fr = self.episode_data_index["from"].numpy()
+        to = self.episode_data_index["to"].numpy()
+        idx = np.concatenate([np.arange(fr[ep], to[ep]) for ep in chosen]) if chosen else np.zeros(0, dtype=np.int64)
+        self._start_idx, self._end_idx = 0, len(idx)
+        logger.info(
+            f"val_split_by_task: {'train' if self.is_training_set else 'val'} split uses {len(chosen)} episodes / "
+            f"{len(idx)} frames; val episodes per task: "
+            f"{ {t: sum(1 for e in eps if e in val_eps) for t, eps in sorted(by_task.items())} }"
+        )
+        return idx.astype(np.int64)
 
     def _setup_meta_lerobot_keys(self):
         """Configs must provide the explicit raw layout for every meta."""
