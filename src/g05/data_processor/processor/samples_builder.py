@@ -325,6 +325,31 @@ class TaskAsSubtaskCoTBuilder(SubtaskCoTBuilder):
         samples["prompt"] = "predict subtask"
 
 
+class SkillExpertContextBuilder(SubtaskCoTBuilder):
+    """Skill-expert training (FM only): the SubtaskCoTBuilder prompt, cut at <EOC>.
+
+    At inference a skill-routed policy prefills the SubtaskCoTBuilder context, generates the
+    subtask to pick the expert, and then runs the expert's flow matching on the KV cache and
+    recurrent states of the context ALONE (G05Policy._context_cache): the action expert never
+    sees the CoT. This template is that context and nothing else:
+
+        <images> Embodiment: ...; Task: ... State: <proprio>; predict subtask\\n <EOC>
+
+    With no <EOV> the whole sequence is the FM prefix (split_index = its length), so training
+    conditions the action expert on exactly the tokens and GatedDeltaNet states it gets at
+    inference. No CoT label is needed, and no token carries a loss (train with
+    discrete_action=false and predict_cot=false, i.e. FM loss only).
+    """
+
+    required_fields = ()
+    eval_required_fields = ()
+
+    @property
+    def template(self) -> str:
+        tpl = super().template
+        return tpl[: tpl.index("<EOC>") + len("<EOC>")]
+
+
 class SubtaskCoTBuilderFMOnly(SubtaskCoTBuilder):
     """Subtask CoT (FM-only variant): AR predicts only subtask text; action uses FM.
 

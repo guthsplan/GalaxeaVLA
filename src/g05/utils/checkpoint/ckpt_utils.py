@@ -82,6 +82,35 @@ def _apply_hf_processor_sidecar(cfg: DictConfig, run_dir: Path):
         cfg.model.processor.tokenizer_params.pretrained_model_name_or_path = str(local_hf)
 
 
+CORR_NOISE_SIDECAR = "action_correlation_factor.npy"
+
+
+def _apply_correlated_noise_sidecar(cfg: DictConfig, run_dir: Path) -> bool:
+    """Serve a correlated-noise FM run with the noise it was trained on.
+
+    finetune.py copies the second-moment factor into ``run_dir/action_correlation_factor.npy``
+    when ``fm.use_correlated_noise`` is on. The factor is not part of the checkpoint and a task
+    YAML defaults to isotropic noise, so without this the ODE would start from N(0, I) while the
+    flow was learned from N(0, Sigma_reg). beta and the embodiment list come from the run's own
+    ``.hydra/config.yaml``; explicit CLI overrides still win (applied afterwards).
+    """
+    factor = Path(run_dir) / CORR_NOISE_SIDECAR
+    if not factor.exists() or OmegaConf.select(cfg, "model.model_arch.fm") is None:
+        return False
+    beta, embodiments = 0.5, ["behavior_r1pro"]
+    hydra_cfg = Path(run_dir) / ".hydra" / "config.yaml"
+    if hydra_cfg.exists():
+        run_fm = OmegaConf.select(OmegaConf.load(hydra_cfg), "model.model_arch.fm") or {}
+        beta = run_fm.get("correlation_beta", beta)
+        embodiments = list(run_fm.get("correlated_noise_embodiments", None) or embodiments)
+    OmegaConf.update(cfg, "model.model_arch.fm.use_correlated_noise", True, merge=False)
+    OmegaConf.update(cfg, "model.model_arch.fm.action_correlation_cholesky_path", str(factor), merge=False)
+    OmegaConf.update(cfg, "model.model_arch.fm.correlation_beta", beta, merge=False)
+    OmegaConf.update(cfg, "model.model_arch.fm.correlated_noise_embodiments", embodiments, merge=False)
+    logger.info(f"Auto-resolved correlated FM noise → {factor} (beta={beta}, embodiments={embodiments})")
+    return True
+
+
 def _apply_action_tokenizer_sidecar(cfg: DictConfig, run_dir: Path) -> bool:
     """Use ``run_dir/action_tokenizer.pt`` for every supported config layout.
 
@@ -187,6 +216,7 @@ def load_config_from_run_dir(run_dir: Path, ckpt_path: str, overrides: list[str]
     # so the saved config still points to the original (possibly unreachable) path.
     if not _apply_action_tokenizer_sidecar(cfg, run_dir):
         logger.info(f"{_YELLOW}⚠️  No local action_tokenizer.pt found, using config default{_RESET}")
+    _apply_correlated_noise_sidecar(cfg, run_dir)
 
     # register_default_resolvers already handles oc.load, eval, split, etc.
     # We only need to add Hydra built-ins (now, oc.env) that aren't in register_default_resolvers.
@@ -266,6 +296,7 @@ def load_config_from_task_yaml(task_yaml: str, ckpt_path: str, overrides: list[s
     _apply_hf_processor_sidecar(cfg, Path(cfg.run_dir))
     if not _apply_action_tokenizer_sidecar(cfg, Path(cfg.run_dir)):
         logger.info(f"{_YELLOW}⚠️  No local action_tokenizer.pt found, using task config default{_RESET}")
+    _apply_correlated_noise_sidecar(cfg, Path(cfg.run_dir))
 
     # Explicit CLI overrides take precedence over automatically discovered
     # sidecars, matching load_config_from_run_dir.

@@ -162,6 +162,20 @@ embodiment_datasets:
     lerobot_ds_version: '3.0'
     shape_meta: *behavior_shape_meta
     stats_downsample_rate: 10
+    # Training split only: one sample per N consecutive frames (random frame within each window),
+    # so an epoch is N x shorter. 30 Hz demos make neighbouring frames near-duplicates.
+    train_frame_stride: 1
+    # Training split only: skill-balanced sampling from the BEHAVIOR skill annotations
+    # (episode meta annotation_path). Skill k gets mass ∝ frames_k ** alpha * skill_weights[k],
+    # uniform over its frames; alpha 1.0 + no weights = off, 0.0 = every skill equal.
+    # skill_weights: "move to=0.3,pick up from=1.5". Annotation files are looked up in the
+    # dataset dir, then in skill_annotation_root (the raw challenge demos).
+    skill_balance_alpha: 1.0
+    skill_weights: null
+    skill_annotation_root: ${oc.env:B1K_RAW_DEMOS,null}
+    # Skill-expert runs (g05/data/skill_groups.py): keep only frames whose annotated skill is in
+    # these groups, in BOTH splits, e.g. "grasp" or "revolute,linear". null / "all" = every frame.
+    skill_groups: null
     dataset_groups:
     - weight: 1.0
       dataset_dirs:
