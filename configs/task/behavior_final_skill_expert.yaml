@@ -15,8 +15,9 @@
 #   training : FM loss only (predict_cot=false skips the CE loss; the CoT text stays in the input),
 #              action-expert LoRA, VLM frozen, frames of the group's skills only
 #   sampling : the same skill-balance floor / cap as stage 1, applied within the group
-#   best.pt  : the tiling eval needs an AR head and an unfiltered val split, so it is off here; best.pt
-#              follows the periodic FM L1 (16 val batches). Export a step checkpoint or best.pt.
+#   data     : every episode with the group's skills trains (no validation split, like stage 1); export
+#              the final checkpoint (<run>/last.pt). To validate: skill_val_episodes_per_task=5 eval_steps=1000
+#              (best.pt = min eval/action/rollout/fm_action_l1).
 #
 #   EXPERT_TASK_CONFIG=behavior_final_skill_expert bash scripts/train_g05_skill_expert.sh <EXP> \
 #       --group grasp --ckpt <stage-1 best.pt>          (scripts/final_recipe.sh experts)
@@ -36,19 +37,20 @@ model:
         _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder
 
 data:
+  val_set_proportion: 0.0          # no generic validation tail either
   embodiment_datasets:
     behavior_r1pro:
       skill_balance_alpha: 1.0
-      skill_balance_floor: 0.01
+      skill_balance_floor: 0.005
       skill_max_visits: 3
-      skill_val_episodes_per_task: 5
+      skill_val_episodes_per_task: 0     # no per-task validation episodes
 
 skill_sampler:
   enabled: false
 eval_tiling:
   enabled: false
 
-eval_steps: 1000
+eval_steps: 1000000000             # no periodic eval
 eval_num_batches: 16
 checkpointing_steps: 10000
 best_metric: eval/action/rollout/fm_action_l1
