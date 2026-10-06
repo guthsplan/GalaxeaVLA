@@ -1,0 +1,55 @@
+# @package _global_
+# Final recipe, stage 2: skill-group action experts on top of the stage-1 checkpoint
+# (behavior_final_cot.yaml). One run per group: navigation, grasp, place, push_contact, tool, inplace,
+# optionally `all` (the fallback for groups without their own expert).
+#
+# FM context (skill_expert_fm_context), recorded in the exported expert (meta fm_context):
+#   cot    (this file, default) - SubtaskCoTBuilder: the expert's FM conditions on the served prompt plus
+#          the subtask CoT up to <EOV>, exactly like the base policy's FM and the AR decode that drives
+#          the arms in hybrid serving, so arms and grippers act on the same subtask. Train the `all`
+#          fallback expert as well (the recipe default and requirement in both modes).
+#   prompt (behavior_final_skill_expert_prompt.yaml) - SkillExpertContextBuilder: the FM sees the prompt
+#          context only (No-CoT); the router serves it on the pre-CoT KV snapshot. Train `all` too,
+#          otherwise uncovered groups run the base FM on the CoT.
+#
+#   training : FM loss only (predict_cot=false skips the CE loss; the CoT text stays in the input),
+#              action-expert LoRA, VLM frozen, frames of the group's skills only
+#   sampling : the same skill-balance floor / cap as stage 1, applied within the group
+#   best.pt  : the tiling eval needs an AR head and an unfiltered val split, so it is off here; best.pt
+#              follows the periodic FM L1 (16 val batches). Export a step checkpoint or best.pt.
+#
+#   EXPERT_TASK_CONFIG=behavior_final_skill_expert bash scripts/train_g05_skill_expert.sh <EXP> \
+#       --group grasp --ckpt <stage-1 best.pt>          (scripts/final_recipe.sh experts)
+defaults:
+- behavior_skill_expert
+- _self_
+
+skill_expert_fm_context: cot
+
+model:
+  processor:
+    samples_builder:
+      candidates:
+      - _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder
+        weight: 1.0
+      eval_builder:
+        _target_: g05.data_processor.processor.samples_builder.SubtaskCoTBuilder
+
+data:
+  embodiment_datasets:
+    behavior_r1pro:
+      skill_balance_alpha: 1.0
+      skill_balance_floor: 0.01
+      skill_max_visits: 3
+      skill_val_episodes_per_task: 5
+
+skill_sampler:
+  enabled: false
+eval_tiling:
+  enabled: false
+
+eval_steps: 1000
+eval_num_batches: 16
+checkpointing_steps: 10000
+best_metric: eval/action/rollout/fm_action_l1
+best_metric_mode: min

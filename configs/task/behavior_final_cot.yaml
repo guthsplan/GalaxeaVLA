@@ -1,0 +1,46 @@
+# @package _global_
+# Final recipe, stage 1: the base CoT LoRA policy.
+#
+#   training : BG CoT (behavior_cot_lora_bg: Subtask/BBox/Trace2D + belief-graph Delta/Update/Observe/
+#              Effect/... candidates), AR + FM heads, LoRA r=32 on the VLM and the action expert
+#   eval     : SubtaskCoTBuilder (the served prompt generates "Subtask: ..." only)
+#   sampling : dataset-level skill balance (g05/data/skill_balance.py): natural frame distribution
+#              (alpha 1) with every skill lifted to >= 1 % of the samples and at most 3 expected visits
+#              per frame over the run (skill_run_samples = max_steps x global batch, set by finetune.py).
+#              Annotations: <dataset>/annotations is NOT allowed (the LeRobot loader reads it as
+#              subtask annotations); keep them in skill_annotation_root ($B1K_RAW_DEMOS).
+#   best.pt  : fixed full-coverage val eval (scripts/utils/tiling_eval.py) every 2000 steps, min
+#              skill-balanced L1 of the hybrid action (arms from the AR decode, the rest from FM)
+#
+# Serving (stage 3): this checkpoint's AR decode drives the arms (conditioned on the generated subtask);
+# grippers / torso / base come from the skill experts of stage 2 (behavior_final_skill_expert.yaml),
+# whose FM sees the prompt context only (no CoT tokens).
+#
+#   TASK_CONFIG=behavior_final_cot bash scripts/train_g05_cot_lora.sh <EXP> --ckpt <warm start> ...
+#   (scripts/final_recipe.sh base)
+defaults:
+- behavior_cot_lora_bg
+- _self_
+
+data:
+  val_split_by_task: true          # hold out the last episodes of EVERY task
+  val_set_proportion: 0.0249       # ceil(0.0249 x 200) = 5 episodes per task
+  embodiment_datasets:
+    behavior_r1pro:
+      skill_balance_alpha: 1.0
+      skill_balance_floor: 0.01
+      skill_max_visits: 3
+
+skill_sampler:
+  enabled: false                   # the sampler-level balancer is mutually exclusive with the above
+
+eval_steps: 2000
+eval_num_batches: 4
+checkpointing_steps: 10000
+eval_tiling:
+  enabled: true
+  every: 2000
+  stride: 32
+  hybrid_ar_parts: [left_control, right_control]
+best_metric: eval/tiling/skill_balanced_hybrid_l1
+best_metric_mode: min

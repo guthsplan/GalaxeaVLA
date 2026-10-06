@@ -1,0 +1,19 @@
+# @package _global_
+# Final recipe, stage 2, prompt-only variant: the expert's FM sees the prompt context alone (No-CoT,
+# SkillExpertContextBuilder = the served SubtaskCoT prompt cut at <EOC>), served on the pre-CoT KV
+# snapshot (G05Policy._context_cache). Train an `all` expert as well: groups without an expert otherwise
+# fall back to the base FM on the CoT. Everything else as behavior_final_skill_expert.yaml.
+defaults:
+- behavior_final_skill_expert
+- _self_
+
+skill_expert_fm_context: prompt
+
+model:
+  processor:
+    samples_builder:
+      candidates:
+      - _target_: g05.data_processor.processor.samples_builder.SkillExpertContextBuilder
+        weight: 1.0
+      eval_builder:
+        _target_: g05.data_processor.processor.samples_builder.SkillExpertContextBuilder

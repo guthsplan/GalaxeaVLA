@@ -48,6 +48,17 @@ def _run_config(ckpt: Path) -> Optional[dict]:
     return OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=False)
 
 
+def fm_context_of(cfg: dict) -> str:
+    """'prompt' when the run trained on SkillExpertContextBuilder (FM sees the prompt only), else 'cot'
+    (e.g. SubtaskCoTBuilder: FM sees the prompt plus the subtask CoT up to <EOV>, like the base policy)."""
+    explicit = cfg.get("skill_expert_fm_context")
+    if explicit in ("cot", "prompt"):
+        return explicit
+    sb = (cfg.get("model", {}).get("processor", {}) or {}).get("samples_builder", {}) or {}
+    target = str((sb.get("eval_builder") or {}).get("_target_", ""))
+    return "prompt" if target.endswith("SkillExpertContextBuilder") else "cot"
+
+
 def _manifest_base(ckpt: Path) -> Optional[Path]:
     """base_checkpoint recorded by scripts/train_g05_skill_expert.sh (kept across resumes)."""
     path = ckpt.resolve().parents[1] / "run_manifest.json"
@@ -210,12 +221,14 @@ def main() -> None:
                 "step": ck.get("step"),
                 "r": r,
                 "alpha_over_r": scale,
+                "fm_context": fm_context_of(cfg),
             },
         },
         args.out,
     )
     size = args.out.stat().st_size / 2**20
-    print(f"wrote {args.out} ({size:.0f} MB){'  [fallback expert]' if groups == [ALL] else ''}")
+    print(f"wrote {args.out} ({size:.0f} MB), fm_context={fm_context_of(cfg)}"
+          f"{'  [fallback expert]' if groups == [ALL] else ''}")
 
 
 if __name__ == "__main__":

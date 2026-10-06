@@ -377,6 +377,10 @@ def main():
     ap.add_argument("--skill-experts", nargs="*", default=None,
                     help="skill-expert files (tools/export_skill_expert.py): the generated CoT subtask "
                          "picks one per model call, and its action expert sees only the prompt context")
+    ap.add_argument("--skill-expert-context", default="auto", choices=["auto", "cot", "prompt"],
+                    help="what the experts' FM conditions on: cot = prompt + generated subtask (like the base "
+                         "policy and the hybrid AR arms), prompt = prompt context only (No-CoT); auto = as "
+                         "each expert was trained (export meta fm_context)")
     ap.add_argument("--skill-min-consecutive", type=int, default=1,
                     help="switch skill group only after this many consecutive predictions of it")
     args = ap.parse_args()
@@ -399,7 +403,8 @@ def main():
         from g05.models.g05.skill_router import SkillExpertRouter
 
         router = SkillExpertRouter(policy_model.model, args.skill_experts,
-                                   min_consecutive=args.skill_min_consecutive)
+                                   min_consecutive=args.skill_min_consecutive,
+                                   fm_context=args.skill_expert_context)
         policy_model.attach_skill_router(router)
     policy = G05B1KPolicy(inferencer, processor, task_text, args.action_steps, image_hw, skill_router=router)
 

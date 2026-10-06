@@ -49,6 +49,9 @@ class _Expert:
         }
         self.full = {name: t for name, t in payload.get("full", {}).items()}
         self.meta = dict(payload.get("meta", {}))
+        # What the expert's FM was trained to condition on: "cot" (prompt + subtask CoT, like the base
+        # policy) or "prompt" (SkillExpertContextBuilder). Files from before this field are "prompt".
+        self.fm_context = self.meta.get("fm_context", "prompt")
 
     @property
     def name(self) -> str:
@@ -66,9 +69,14 @@ class SkillExpertRouter:
             a row (1 = follow every prediction). Unparsable subtasks never switch.
     """
 
-    def __init__(self, model: nn.Module, expert_paths: Sequence[str], min_consecutive: int = 1):
+    def __init__(self, model: nn.Module, expert_paths: Sequence[str], min_consecutive: int = 1,
+                 fm_context: str = "auto"):
         if min_consecutive < 1:
             raise ValueError(f"min_consecutive must be >= 1, got {min_consecutive}")
+        if fm_context not in ("auto", "cot", "prompt"):
+            raise ValueError(f"fm_context must be auto | cot | prompt, got {fm_context!r}")
+        # auto: each expert as it was trained (meta fm_context); cot / prompt: force it for every expert
+        self.fm_context = fm_context
         self.model = model
         self.min_consecutive = int(min_consecutive)
         ae = model.action_expert
@@ -124,10 +132,12 @@ class SkillExpertRouter:
         self._streak = 0
         logger.info(
             "[skill-router] experts: %s; fallback: %s; groups without an expert run the base action "
-            "expert on the full CoT KV; min_consecutive=%d",
+            "expert on the full CoT KV; min_consecutive=%d; fm_context=%s %s",
             {g: e.path for g, e in self.by_group.items()},
             self.fallback.path if self.fallback else None,
             self.min_consecutive,
+            self.fm_context,
+            {e.name: self._expert_context(e) for e in self.experts},
         )
 
     # ------------------------------------------------------------------
@@ -175,8 +185,9 @@ class SkillExpertRouter:
         """Pick the group for one model call and activate its expert.
 
         Returns ``{"skill", "group" (the group in effect), "expert" (name or None),
-        "context_only"}``. ``context_only`` is False when no expert covers the group: the base
-        action expert was trained on the full CoT KV and is run that way.
+        "context_only"}``. ``context_only`` is True when the active expert conditions on the prompt
+        context alone (fm_context "prompt"); False for "cot" experts and when no expert covers the
+        group (the base action expert was trained on the full CoT KV and is run that way).
         """
         skill = skill_from_subtask(cot_text)
         predicted = SKILL_TO_GROUP.get(skill) if skill else None
@@ -199,8 +210,11 @@ class SkillExpertRouter:
             "skill": skill,
             "group": self.current_group,
             "expert": expert.name if expert is not None else None,
-            "context_only": expert is not None,
+            "context_only": expert is not None and self._expert_context(expert) == "prompt",
         }
+
+    def _expert_context(self, expert: _Expert) -> str:
+        return expert.fm_context if self.fm_context == "auto" else self.fm_context
 
     def remove(self) -> None:
         """Detach the hooks and restore the base action expert."""

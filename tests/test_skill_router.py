@@ -26,7 +26,7 @@ class _Toy(nn.Module):
 Q0 = "action_expert.layers.0.self_attn.q_proj"
 
 
-def _expert(tmp_path, model, groups, seed, full=True, fingerprint=None):
+def _expert(tmp_path, model, groups, seed, full=True, fingerprint=None, meta=None):
     g = torch.Generator().manual_seed(seed)
     lora = {Q0: {"A": torch.randn(2, 8, generator=g), "B": torch.randn(8, 2, generator=g)}}
     payload = {
@@ -37,7 +37,7 @@ def _expert(tmp_path, model, groups, seed, full=True, fingerprint=None):
         "base_fingerprint": fingerprint
         if fingerprint is not None
         else {"vlm.weight": float(model.vlm.weight.double().sum())},
-        "meta": {},
+        "meta": dict(meta or {}),
     }
     path = tmp_path / f"{'_'.join(groups)}.pt"
     torch.save(payload, path)
@@ -117,3 +117,19 @@ def test_rejects_wrong_base_and_duplicate_groups(tmp_path):
     p2, _ = _expert(tmp_path, model, ["grasp", "place"], 2)
     with pytest.raises(ValueError, match="two experts"):
         SkillExpertRouter(model, [str(p1), str(p2)])
+
+
+def test_fm_context_cot_experts_keep_the_full_cot_kv(tmp_path):
+    model = _Toy()
+    p_cot, _ = _expert(tmp_path, model, ["grasp"], 1, meta={"fm_context": "cot"})
+    p_old, _ = _expert(tmp_path, model, ["place"], 2)                      # no meta: trained prompt-only
+    router = SkillExpertRouter(model, [str(p_cot), str(p_old)])            # auto: as each was trained
+    assert router.route("Subtask: pick up a from b") == {
+        "skill": "pick up from", "group": "grasp", "expert": "grasp", "context_only": False}
+    assert router.route("Subtask: place a on b")["context_only"] is True
+    forced = SkillExpertRouter(_Toy(), [str(p_cot)], fm_context="prompt")
+    assert forced.route("Subtask: pick up a from b")["context_only"] is True
+    forced = SkillExpertRouter(_Toy(), [str(p_old)], fm_context="cot")
+    assert forced.route("Subtask: place a on b")["context_only"] is False
+    with pytest.raises(ValueError):
+        SkillExpertRouter(_Toy(), [str(p_cot)], fm_context="none")

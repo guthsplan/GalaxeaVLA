@@ -103,3 +103,18 @@ def test_base_from_manifest_and_resume_chain(tmp_path):
     assert ex._manifest_base(inplace) is None
     (tmp_path / "inplace" / "run_manifest.json").write_text(json.dumps({"base_checkpoint": "/cot/best.pt"}))
     assert ex._manifest_base(inplace) == Path("/cot/best.pt")
+
+
+def test_fm_context_from_the_run_config():
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "export_skill_expert", Path(__file__).resolve().parents[1] / "tools" / "export_skill_expert.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    builder = lambda name: {"model": {"processor": {"samples_builder": {
+        "eval_builder": {"_target_": f"g05.data_processor.processor.samples_builder.{name}"}}}}}
+    assert mod.fm_context_of(builder("SkillExpertContextBuilder")) == "prompt"
+    assert mod.fm_context_of(builder("SubtaskCoTBuilder")) == "cot"
+    assert mod.fm_context_of({**builder("SubtaskCoTBuilder"), "skill_expert_fm_context": "prompt"}) == "prompt"
