@@ -63,3 +63,7 @@ data:
   embodiment_datasets:
     behavior_r1pro:
       skill_groups: null   # set per run, e.g. grasp | push_contact,tool | all
+      # N > 0: validation = per task, the last N episodes with a kept skill, the rest trains.
+      # 0 = the generic split (the last 0.5% of all episodes = one task only on b1k_5task, and
+      # no tool frame at all, so a tool run stops at start-up)
+      skill_val_episodes_per_task: 5

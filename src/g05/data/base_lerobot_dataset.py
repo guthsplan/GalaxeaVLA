@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from g05.data.skill_balance import SkillBalancedIndex, parse_skill_weights
+from g05.data.skill_balance import SkillBalancedIndex, parse_skill_weights, skill_val_episodes
 from g05.data.skill_groups import ALL, parse_groups, skills_of
 from g05.data_processor.processor.base_processor import BaseProcessor
 from g05.utils.logging.logging_config import get_logger
@@ -117,6 +117,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         # skill-expert runs (g05.data.skill_groups): keep only frames whose annotated skill is in
         # these groups, e.g. "grasp,place"; applies to the validation split too. null / "all" = off
         skill_groups: Union[None, str, List[str]] = None,
+        # with skill_groups: validation = per task, the last N episodes containing a kept skill;
+        # training = every other episode (replaces the val_set_proportion episode tail). 0 = off
+        skill_val_episodes_per_task: int = 0,
         **kwargs,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
@@ -319,6 +322,20 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         groups = parse_groups(_to_plain(skill_groups))
         keep_skills = skills_of(groups) if groups and groups != [ALL] else None
         balance = self.is_training_set and (float(skill_balance_alpha) != 1.0 or bool(skill_weights))
+        split_episodes = None
+        if int(skill_val_episodes_per_task) > 0 and keep_skills is not None:
+            ep_from = self.episode_data_index["from"].tolist()
+            ep_to = self.episode_data_index["to"].tolist()
+            val_eps = skill_val_episodes(
+                self.multi_dataset._datasets, ep_from, ep_to, keep_skills,
+                int(skill_val_episodes_per_task), skill_annotation_root,
+            )
+            split_episodes = (
+                set(range(len(ep_from))) - val_eps if self.is_training_set else val_eps
+            )
+            self._start_idx, self._end_idx = 0, self.multi_dataset.num_frames
+            n = sum(ep_to[e] - ep_from[e] for e in split_episodes)
+            self._len_override = -(-n // self.train_frame_stride)
         if balance or keep_skills is not None:
             # The validation split is only filtered by skill group, never re-balanced.
             self._skill_index = SkillBalancedIndex(
@@ -328,6 +345,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 start_idx=self._start_idx,
                 end_idx=self._end_idx,
                 num_samples=len(self),
+                episodes=split_episodes,
                 alpha=float(skill_balance_alpha) if balance else 1.0,
                 skill_weights=skill_weights if balance else {},
                 annotation_root=skill_annotation_root,
@@ -831,6 +849,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
     def __len__(self):
         if hasattr(self, "_overfit_len"):
             return self._overfit_len
+        if hasattr(self, "_len_override"):  # skill_val_episodes_per_task split
+            return self._len_override
         n = self._end_idx - self._start_idx
         stride = getattr(self, "train_frame_stride", 1)
         return -(-n // stride) if stride > 1 else n
@@ -902,6 +922,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         Subclasses with index filtering (e.g. DroidLerobotDataset's
         _valid_local_indices) override to ensure retry stays within valid frames.
         """
+        if getattr(self, "_skill_index", None) is not None:  # stay in the split's skill frames
+            return self._skill_index(np.random.randint(len(self)))
         return np.random.randint(self._start_idx, self._end_idx)
 
     def __getitem__(self, idx):

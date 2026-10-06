@@ -74,3 +74,32 @@ def test_export_refuses_a_wrong_base(tmp_path):
     torch.save(ck, tmp_path / "base.pt")
     r = _run(tmp_path, "--groups", "grasp")
     assert r.returncode != 0 and "do not reproduce the merged weights" in (r.stdout + r.stderr)
+
+
+def test_base_from_manifest_and_resume_chain(tmp_path):
+    import json
+
+    sys.path.insert(0, str(TOOL.parent))
+    import export_skill_expert as ex
+
+    def run(name, cfg, manifest=None):
+        d = tmp_path / name
+        (d / ".hydra").mkdir(parents=True)
+        (d / "checkpoints").mkdir()
+        (d / ".hydra" / "config.yaml").write_text(cfg)
+        if manifest is not None:
+            (d / "run_manifest.json").write_text(json.dumps(manifest))
+        return d / "checkpoints" / "step_5.pt"
+
+    first = run("first", "resume_ckpt: null\nmodel:\n  pretrained_ckpt: /cot/best.pt\n")
+    second = run("second", f"resume_ckpt: {first}\nmodel:\n  pretrained_ckpt: g05-base.pt\n")
+    third = run("third", f"resume_ckpt: {second}\nmodel:\n  pretrained_ckpt: g05-base.pt\n")
+    inplace = tmp_path / "inplace" / "checkpoints" / "step_9.pt"
+    run("inplace", f"resume_ckpt: {inplace}\nmodel:\n  pretrained_ckpt: g05-base.pt\n")
+    for ck in (first, second, third):
+        assert ex._config_base(ck, ex._run_config(ck)) == Path("/cot/best.pt")
+    # resumed into its own directory: the config no longer knows; the manifest does
+    assert ex._config_base(inplace, ex._run_config(inplace)) is None
+    assert ex._manifest_base(inplace) is None
+    (tmp_path / "inplace" / "run_manifest.json").write_text(json.dumps({"base_checkpoint": "/cot/best.pt"}))
+    assert ex._manifest_base(inplace) == Path("/cot/best.pt")

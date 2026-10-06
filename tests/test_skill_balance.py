@@ -80,3 +80,36 @@ def _index_args(tmp_path):
     meta = types.SimpleNamespace(episodes=_Cols({"annotation_path": ["annotations/ep0.json", "annotations/ep1.json"]}))
     ds = types.SimpleNamespace(meta=meta, root=str(tmp_path))
     return [ds], [0, 1000], [1000, 2000], 0, 2000
+
+
+def test_per_task_val_split(tmp_path):
+    from g05.data.skill_balance import skill_val_episodes
+
+    # 6 episodes of 100 frames: task 0 = eps 0-2 ("chop" in 0, 1), task 1 = eps 3-5 ("chop" in 3, 4, 5)
+    (tmp_path / "annotations").mkdir()
+    skills = ["chop", "chop", "move to", "chop", "chop", "chop"]
+    paths = []
+    for i, sk in enumerate(skills):
+        rel = f"annotations/ep{i}.json"
+        (tmp_path / rel).write_text(json.dumps(_ann(("move to", [0, 50]), (sk, [50, 100]))))
+        paths.append(rel)
+    meta = types.SimpleNamespace(episodes=_Cols({"annotation_path": paths, "task_index": [0, 0, 0, 1, 1, 1]}))
+    ds = types.SimpleNamespace(meta=meta, root=str(tmp_path))
+    ep_from, ep_to = [100 * i for i in range(6)], [100 * (i + 1) for i in range(6)]
+
+    # last chop episode of each task; ep 2 (no chop) is never validation
+    val = skill_val_episodes([ds], ep_from, ep_to, ["chop"], 1)
+    assert val == {1, 5}
+    # one chop episode of each task always stays in training
+    assert skill_val_episodes([ds], ep_from, ep_to, ["chop"], 5) == {1, 4, 5}
+    with pytest.raises(ValueError):
+        skill_val_episodes([ds], ep_from, ep_to, ["pour"], 1)
+
+    train = SkillBalancedIndex([ds], ep_from, ep_to, 0, 600, 500, keep_skills=["chop"],
+                               episodes=set(range(6)) - val)
+    vidx = SkillBalancedIndex([ds], ep_from, ep_to, 0, 600, 100, keep_skills=["chop"], episodes=val)
+    np.random.seed(0)
+    tf = {train(i) // 100 for i in range(500)}
+    vf = {vidx(i) // 100 for i in range(100)}
+    assert tf == {0, 3, 4} and vf == {1, 5}
+    assert all(train.skill_of(train(i)) == "chop" for i in range(500))

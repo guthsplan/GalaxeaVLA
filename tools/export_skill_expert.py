@@ -15,8 +15,10 @@ router serves every expert on the base checkpoint's VLM, so anything trained the
     python tools/export_skill_expert.py <run>/checkpoints/step_N.pt -o experts/grasp.pt
         [--base <cot ckpt>] [--groups grasp]
 
---base / --groups default to the run's .hydra/config.yaml (model.pretrained_ckpt and
-data.embodiment_datasets.*.skill_groups).
+--base defaults to base_checkpoint in the run's run_manifest.json (written by
+scripts/train_g05_skill_expert.sh), else model.pretrained_ckpt of the run's .hydra/config.yaml,
+following resume_ckpt back to the run that started from it. --groups defaults to the config's
+data.embodiment_datasets.*.skill_groups.
 """
 
 from __future__ import annotations
@@ -44,6 +46,35 @@ def _run_config(ckpt: Path) -> Optional[dict]:
     from omegaconf import OmegaConf
 
     return OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=False)
+
+
+def _manifest_base(ckpt: Path) -> Optional[Path]:
+    """base_checkpoint recorded by scripts/train_g05_skill_expert.sh (kept across resumes)."""
+    path = ckpt.resolve().parents[1] / "run_manifest.json"
+    if not path.is_file():
+        return None
+    import json
+
+    base = json.loads(path.read_text()).get("base_checkpoint")
+    return Path(base) if base else None
+
+
+def _config_base(ckpt: Path, cfg: dict) -> Optional[Path]:
+    """The CoT checkpoint the run started from. A resumed run (resume_ckpt) only carries the
+    model config's default pretrained_ckpt, so follow resume_ckpt back to the run that started
+    from model.pretrained_ckpt. A run resumed into its own directory overwrote that config:
+    then only the manifest (or --base) knows."""
+    seen = {ckpt.resolve().parents[1]}
+    while cfg.get("resume_ckpt"):
+        prev = Path(cfg["resume_ckpt"])
+        if prev.resolve().parents[1] in seen:
+            return None
+        seen.add(prev.resolve().parents[1])
+        cfg = _run_config(prev)
+        if cfg is None:
+            return None
+    path = cfg.get("model", {}).get("pretrained_ckpt")
+    return Path(path) if path else None
 
 
 def _config_groups(cfg: dict) -> Optional[str]:
@@ -82,9 +113,10 @@ def main() -> None:
 
     cfg = _run_config(args.ckpt) or {}
     lora_cfg = cfg.get("model", {}).get("lora", {}) or {}
-    base_path = args.base or (Path(cfg["model"]["pretrained_ckpt"]) if cfg.get("model", {}).get("pretrained_ckpt") else None)
+    base_path = args.base or _manifest_base(args.ckpt) or (_config_base(args.ckpt, cfg) if cfg else None)
     if base_path is None:
-        raise SystemExit("no base checkpoint: pass --base (the run config has no model.pretrained_ckpt)")
+        raise SystemExit("no base checkpoint: pass --base (neither run_manifest.json base_checkpoint nor "
+                         "the run config chain names the CoT checkpoint the run started from)")
     groups_spec = args.groups or _config_groups(cfg)
     if not groups_spec:
         raise SystemExit("no skill groups: pass --groups (the run config sets no skill_groups)")

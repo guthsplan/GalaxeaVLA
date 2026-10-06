@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Collection, Dict, List, Optional, Sequence, Set, Union
 
 import numpy as np
 
@@ -89,6 +89,56 @@ def _episode_segments(ann: dict, length: int) -> List[tuple]:
     return runs
 
 
+def _annotation_file(ds, rel, annotation_root: Optional[str]) -> Optional[Path]:
+    roots = [Path(ds.root)] + ([Path(annotation_root)] if annotation_root else [])
+    return next((r / rel for r in roots if rel and (r / rel).is_file()), None)
+
+
+def skill_val_episodes(
+    datasets: Sequence,
+    episode_from: Sequence[int],
+    episode_to: Sequence[int],
+    keep_skills: Collection[str],
+    per_task: int,
+    annotation_root: Optional[str] = None,
+) -> Set[int]:
+    """Validation episodes of a skill-expert run: per task, the last `per_task` episodes (in
+    episode order) that contain a kept skill. Global episode indices over `datasets`.
+
+    The episode-tail split (`val_set_proportion`) takes the last episodes of the whole set,
+    i.e. of one task when the episodes are grouped by task, which may hold none of a group's
+    skills (b1k_5task: the tail is cook_hot_dogs, the tool skills are in chopping_wood).
+    """
+    keep = set(keep_skills)
+    by_task: Dict[tuple, List[int]] = {}
+    ep = 0
+    for di, ds in enumerate(datasets):
+        meta_eps = ds.meta.episodes
+        tasks = meta_eps["task_index"] if "task_index" in meta_eps.column_names else [None] * len(meta_eps)
+        for rel, task in zip(meta_eps["annotation_path"], tasks):
+            path = _annotation_file(ds, rel, annotation_root)
+            if path is not None:
+                with open(path) as f:
+                    segs = _episode_segments(json.load(f), int(episode_to[ep]) - int(episode_from[ep]))
+                if any(skill in keep for _, _, skill in segs):
+                    by_task.setdefault((di, task), []).append(ep)
+            ep += 1
+    if not by_task:
+        raise ValueError(f"none of the skills {sorted(keep)} occur in the dataset")
+    val = set()
+    for eps in by_task.values():
+        k = min(per_task, len(eps) - 1)  # keep at least one episode of each task for training
+        if k > 0:
+            val.update(eps[-k:])
+    if not val:
+        raise ValueError(f"skill_val_episodes_per_task: every task has a single episode with {sorted(keep)}")
+    logger.info(
+        f"[skill-balance] per-task validation split: {len(val)} episodes over {len(by_task)} tasks "
+        f"with {sorted(keep)} (<= {per_task} per task)"
+    )
+    return val
+
+
 class SkillBalancedIndex:
     """Maps sample index -> global frame index with per-skill sampling mass."""
 
@@ -104,7 +154,9 @@ class SkillBalancedIndex:
         skill_weights: Optional[Dict[str, float]] = None,
         annotation_root: Optional[str] = None,
         keep_skills: Optional[Sequence[str]] = None,
+        episodes: Optional[Collection[int]] = None,
     ):
+        """`episodes`: global episode indices to draw from (default: every episode in range)."""
         if alpha < 0:
             raise ValueError(f"skill_balance_alpha must be >= 0, got {alpha}")
         skill_weights = dict(skill_weights or {})
@@ -120,13 +172,12 @@ class SkillBalancedIndex:
                     f"{ds.root}: episode meta has no 'annotation_path' column; skill-balanced "
                     "sampling needs the BEHAVIOR challenge episode meta."
                 )
-            roots = [Path(ds.root)] + ([Path(annotation_root)] if annotation_root else [])
             for rel in meta_eps["annotation_path"]:
                 g0, g1 = int(episode_from[ep]), int(episode_to[ep])
                 ep += 1
-                if g1 <= start_idx or g0 >= end_idx:
+                if g1 <= start_idx or g0 >= end_idx or (episodes is not None and ep - 1 not in episodes):
                     continue
-                path = next((r / rel for r in roots if rel and (r / rel).is_file()), None)
+                path = _annotation_file(ds, rel, annotation_root)
                 if path is None:
                     missing += 1
                     segs = [(0, g1 - g0, UNANNOTATED)]
@@ -162,7 +213,10 @@ class SkillBalancedIndex:
             # skill-expert runs (g05.data.skill_groups): every other skill gets no mass
             keep = set(keep_skills)
             if not keep & set(skills):
-                raise ValueError(f"none of the skills {sorted(keep)} occur in this split")
+                raise ValueError(
+                    f"none of the skills {sorted(keep)} occur in this split (the validation split is "
+                    "the last episodes of the set; skill_val_episodes_per_task=N takes N per task)"
+                )
             mult *= np.asarray([s in keep for s in skills], dtype=np.float64)
         mass = frames_per_skill ** alpha * mult
         if mass.sum() <= 0:
