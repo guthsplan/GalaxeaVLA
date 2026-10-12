@@ -168,6 +168,12 @@ def subtask_rows(root: Path, task: int, raw_id: int, length: int,
             row["frame"] = f
     if rows and last_end < length:
         rows.append({"episode": raw_id, "frame": last_end, "subtask": "done"})
+    # the gap walk-back (or a zero-length segment) can land two rows on one frame: the later wins,
+    # as for two segments starting on one frame (the merge rejects duplicate (episode, frame) keys)
+    by_frame: Dict[int, dict] = {}
+    for row in rows:
+        by_frame[row["frame"]] = row
+    rows = [by_frame[f] for f in sorted(by_frame)]
     return rows, None if rows else "empty"
 
 
