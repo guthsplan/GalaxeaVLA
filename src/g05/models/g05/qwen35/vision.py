@@ -22,23 +22,22 @@ from .modules import rotate_half
 _flash_attn_varlen = None
 _flash_attn_backend = None
 
-try:
-    from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen
-
-    _flash_attn_varlen = _fa4_varlen
-    _flash_attn_backend = "fa4"
-except ImportError:
+# sm_120 (RTX PRO 6000) cannot build FA4 CuTe kernels, and a flash_attn/quack built for a newer torch fails at
+# import with AttributeError (e.g. torch.float4_e2m1fn_x2): skip the import entirely when disabled
+if __import__("os").environ.get("G05_DISABLE_FLASH_ATTN") != "1":
     try:
-        from flash_attn import flash_attn_varlen_func as _fa2_varlen
+        from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen
 
-        _flash_attn_varlen = _fa2_varlen
-        _flash_attn_backend = "fa2"
-    except ImportError:
-        pass
+        _flash_attn_varlen = _fa4_varlen
+        _flash_attn_backend = "fa4"
+    except Exception:
+        try:
+            from flash_attn import flash_attn_varlen_func as _fa2_varlen
 
-if __import__("os").environ.get("G05_DISABLE_FLASH_ATTN") == "1":  # sm_120 (RTX PRO 6000) cannot build FA4 CuTe kernels
-    _flash_attn_varlen = None
-    _flash_attn_backend = None
+            _flash_attn_varlen = _fa2_varlen
+            _flash_attn_backend = "fa2"
+        except Exception:
+            pass
 
 _VISION_FLASH_ATTN_WARNED = False
 

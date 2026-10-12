@@ -33,7 +33,7 @@ try:
     from flash_attn import flash_attn_func
 
     _FLASH_AVAILABLE = True
-except ImportError:
+except Exception:  # ImportError, or a flash_attn built for another torch
     _FLASH_AVAILABLE = False
     flash_attn_func = None
 if __import__("os").environ.get("G05_DISABLE_FLASH_ATTN") == "1":
