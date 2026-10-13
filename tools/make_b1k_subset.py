@@ -241,10 +241,11 @@ def main():
     idx = tbl.column("index").to_numpy()
     assert np.array_equal(idx, np.arange(len(idx))), "index column is not 0..N-1"
     ep = tbl.column("episode_index").to_numpy()
+    fi = tbl.column("frame_index").to_numpy()  # once: converting the column per episode is O(episodes x frames)
     for i in range(len(sel)):
         a, b = int(sel_out.dataset_from_index[i]), int(sel_out.dataset_to_index[i])
         assert np.all(ep[a:b] == i), f"episode {i} rows mismatch"
-        assert tbl.column("frame_index").to_numpy()[a] == 0
+        assert fi[a] == 0
     ti = tbl.column("task_index").to_numpy()
     log(f"OK: {len(sel)} episodes, {len(idx)} frames, task_index counts: "
         f"{dict(zip(*np.unique(ti, return_counts=True)))}")
