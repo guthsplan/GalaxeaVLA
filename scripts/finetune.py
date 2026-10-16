@@ -1139,14 +1139,29 @@ def finetune(cfg: DictConfig):
         epoch = checkpoint["epoch"]
         batch_idx = checkpoint["batch_idx"]
         action_batch_idx = checkpoint.get("action_batch_idx", 0)
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        _reset_count = fix_optimizer_state_after_resume(optimizer)
-        if _reset_count > 0:
+        if checkpoint.get("optimizer_state_dict") is None:
+            # A final checkpoint (inference-only, no optimizer / scheduler state): continue its weights
+            # with a fresh optimizer and the LR schedule of this run placed at the checkpoint's step.
+            if not hasattr(scheduler, "lr_lambdas"):
+                raise ValueError(f"{cfg.resume_ckpt} has no optimizer state and the "
+                                 f"{type(scheduler).__name__} schedule cannot be placed at step {step}")
+            scheduler.last_epoch = step
+            scheduler._last_lr = [base * fn(step) for base, fn in zip(scheduler.base_lrs, scheduler.lr_lambdas)]
+            for group, lr in zip(optimizer.param_groups, scheduler._last_lr):
+                group["lr"] = lr
             logger.warning(
-                f"Reset optimizer state for {_reset_count} params due to shape mismatch "
-                f"between checkpoint and current model (e.g., vocab size changed)."
+                f"{cfg.resume_ckpt} has no optimizer / scheduler state: fresh optimizer, "
+                f"LR schedule placed at step {step} (lr {scheduler._last_lr[0]:.3g})"
             )
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        else:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            _reset_count = fix_optimizer_state_after_resume(optimizer)
+            if _reset_count > 0:
+                logger.warning(
+                    f"Reset optimizer state for {_reset_count} params due to shape mismatch "
+                    f"between checkpoint and current model (e.g., vocab size changed)."
+                )
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if use_ema:
             try:
                 ema_model.ema_model.load_state_dict(checkpoint["ema_model_state_dict"])

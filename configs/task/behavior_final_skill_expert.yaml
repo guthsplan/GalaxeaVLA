@@ -44,6 +44,7 @@ data:
       skill_balance_floor: 0.005
       skill_max_visits: 3
       skill_val_episodes_per_task: 0     # no per-task validation episodes
+      task_indices: null                 # e.g. [3, 17]: train on these dataset task_index values only
 
 skill_sampler:
   enabled: false

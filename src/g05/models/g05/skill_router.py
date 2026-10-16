@@ -67,14 +67,21 @@ class SkillExpertRouter:
             the fallback for groups without their own expert.
         min_consecutive: switch to a new group only after it was predicted this many calls in
             a row (1 = follow every prediction). Unparsable subtasks never switch.
+        unrouted: model calls whose subtask maps to no skill group ("done", unparsed templates,
+            garbled text): "keep" runs the expert of the group in effect (default); "fallback" runs
+            the fallback for that call only, i.e. the ``all`` expert, or the base action expert when
+            there is none. Groups without an expert always run the fallback.
     """
 
     def __init__(self, model: nn.Module, expert_paths: Sequence[str], min_consecutive: int = 1,
-                 fm_context: str = "auto"):
+                 fm_context: str = "auto", unrouted: str = "keep"):
         if min_consecutive < 1:
             raise ValueError(f"min_consecutive must be >= 1, got {min_consecutive}")
         if fm_context not in ("auto", "cot", "prompt"):
             raise ValueError(f"fm_context must be auto | cot | prompt, got {fm_context!r}")
+        if unrouted not in ("keep", "fallback"):
+            raise ValueError(f"unrouted must be keep | fallback, got {unrouted!r}")
+        self.unrouted = unrouted
         # auto: each expert as it was trained (meta fm_context); cot / prompt: force it for every expert
         self.fm_context = fm_context
         self.model = model
@@ -131,10 +138,11 @@ class SkillExpertRouter:
         self._candidate: Optional[str] = None
         self._streak = 0
         logger.info(
-            "[skill-router] experts: %s; fallback: %s; groups without an expert run the base action "
-            "expert on the full CoT KV; min_consecutive=%d; fm_context=%s %s",
+            "[skill-router] experts: %s; fallback: %s (None = the base action expert on the full CoT KV) "
+            "for groups without an expert%s; min_consecutive=%d; fm_context=%s %s",
             {g: e.path for g, e in self.by_group.items()},
             self.fallback.path if self.fallback else None,
+            " and unrouted subtasks" if self.unrouted == "fallback" else "",
             self.min_consecutive,
             self.fm_context,
             {e.name: self._expert_context(e) for e in self.experts},
@@ -203,12 +211,16 @@ class SkillExpertRouter:
                 if self._streak >= self.min_consecutive:
                     self.current_group = predicted
                     self._candidate, self._streak = None, 0
-        expert = self.by_group.get(self.current_group) if self.current_group else None
-        expert = expert or self.fallback
+        if predicted is None and self.unrouted == "fallback":
+            group, expert = None, self.fallback   # this call only; the group in effect is kept
+        else:
+            group = self.current_group
+            expert = self.by_group.get(group) if group else None
+            expert = expert or self.fallback
         self._activate(expert)
         return {
             "skill": skill,
-            "group": self.current_group,
+            "group": group,
             "expert": expert.name if expert is not None else None,
             "context_only": expert is not None and self._expert_context(expert) == "prompt",
         }

@@ -383,6 +383,9 @@ def main():
                          "each expert was trained (export meta fm_context)")
     ap.add_argument("--skill-min-consecutive", type=int, default=1,
                     help="switch skill group only after this many consecutive predictions of it")
+    ap.add_argument("--skill-unrouted", default="keep", choices=["keep", "fallback"],
+                    help="subtasks that map to no skill group: keep the current group's expert, or run the "
+                         "fallback for that call (the 'all' expert, or the base action expert without one)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -404,7 +407,8 @@ def main():
 
         router = SkillExpertRouter(policy_model.model, args.skill_experts,
                                    min_consecutive=args.skill_min_consecutive,
-                                   fm_context=args.skill_expert_context)
+                                   fm_context=args.skill_expert_context,
+                                   unrouted=args.skill_unrouted)
         policy_model.attach_skill_router(router)
     policy = G05B1KPolicy(inferencer, processor, task_text, args.action_steps, image_hw, skill_router=router)
 

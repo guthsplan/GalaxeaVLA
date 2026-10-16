@@ -42,6 +42,17 @@ def _to_plain(obj):
     return obj
 
 
+def _parse_task_indices(spec) -> Optional[Set[int]]:
+    """task_indices option: None / "" / "all" -> None (no filter); int, "3,17" or [3, 17] -> {3, 17}."""
+    if spec is None or (isinstance(spec, str) and spec.strip().lower() in ("", "all", "none", "null")):
+        return None
+    if isinstance(spec, (int, np.integer)):
+        return {int(spec)}
+    if isinstance(spec, str):
+        spec = [s for s in spec.replace(" ", ",").split(",") if s]
+    return {int(s) for s in spec}
+
+
 def shift_sequence_with_replication(data: torch.Tensor, offset: int) -> torch.Tensor:
     """
     Shift a single-episode sequence by `offset`.
@@ -127,6 +138,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         # with skill_groups: validation = per task, the last N episodes containing a kept skill;
         # training = every other episode (replaces the val_set_proportion episode tail). 0 = off
         skill_val_episodes_per_task: int = 0,
+        # keep only the episodes of these dataset task_index values (train and validation), e.g. [3, 17] or
+        # "3,17"; combines with skill_groups / skill balancing. null = every task
+        task_indices: Union[None, str, int, List[int]] = None,
         **kwargs,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
@@ -359,7 +373,20 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             # val_split_by_task: the split is a set of episodes, not a contiguous frame range
             split_episodes = self._split_episodes
             index_lo, index_hi = 0, self.multi_dataset.num_frames
-        if balance or keep_skills is not None:
+        keep_tasks = _parse_task_indices(_to_plain(task_indices))
+        if keep_tasks is not None:
+            ep_task = self._episode_task_indices()
+            if ep_task is None:
+                raise ValueError("task_indices needs a per-episode task_index in the dataset meta")
+            task_eps = {ep for ep, t in enumerate(ep_task) if t in keep_tasks}
+            split_episodes = task_eps if split_episodes is None else set(split_episodes) & task_eps
+            fr = self.episode_data_index["from"].tolist()
+            to = self.episode_data_index["to"].tolist()
+            n = sum(min(to[e], index_hi) - max(fr[e], index_lo) for e in split_episodes
+                    if to[e] > index_lo and fr[e] < index_hi)
+            self._len_override = max(1, -(-n // self.train_frame_stride))
+            logger.info(f"task_indices {sorted(keep_tasks)}: {len(split_episodes)} episodes / {n} frames")
+        if balance or keep_skills is not None or keep_tasks is not None:
             # The validation split is only filtered by skill group, never re-balanced.
             self._skill_index = SkillBalancedIndex(
                 datasets=self.multi_dataset._datasets,
@@ -379,10 +406,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             )
 
 
-    def _stratified_sample_indices(self, val_set_proportion: float):
-        import math
-        from collections import defaultdict
-
+    def _episode_task_indices(self) -> Optional[List[int]]:
+        """task_index of every (global) episode, or None when the dataset meta has none."""
         ep_task = []
         for ds in self.multi_dataset._datasets:
             # v3: ds.meta.episodes is a datasets.Dataset with the meta/episodes columns
@@ -399,9 +424,18 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 try:
                     tasks = [int(eps[i]["task_index"]) for i in range(n)]
                 except Exception:
-                    logger.warning("val_split_by_task: no per-episode task_index; falling back to the tail split")
                     return None
             ep_task.extend(int(t) for t in tasks)
+        return ep_task
+
+    def _stratified_sample_indices(self, val_set_proportion: float):
+        import math
+        from collections import defaultdict
+
+        ep_task = self._episode_task_indices()
+        if ep_task is None:
+            logger.warning("val_split_by_task: no per-episode task_index; falling back to the tail split")
+            return None
         by_task = defaultdict(list)
         for ep, t in enumerate(ep_task):
             by_task[t].append(ep)

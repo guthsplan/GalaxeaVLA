@@ -92,6 +92,7 @@ def skill_weights_for_groups(groups: Sequence[str], skills_present: Iterable[str
 # tools/build_b1k_bbox_trace_sidecars.py::_subtask_text:
 #   bgdata.operators.TEXT     move {mp}to {o} | pick up {mp}{o} from {r} | place {o} on {r}
 #                             place {o} in {r} | open door {d} | close door {d} | turn on switch {d}
+#                             sweep {r} with {o} (sweep surface) | wipe {r} with {o} (wipe hard)
 #   EXTRA_SUBTASK_TEXT        open lid {0} | close lid {0} | hand over {0} from {1} to {2} hand
 #                             turn {0} to {1} | push {0} to {1} | place {0} on {1} next to {2}
 #                             chop {1} with {0} | sweep {0} off {1}
@@ -103,11 +104,16 @@ _TEMPLATE_RULES = (
     (re.compile(r"^move\b"), "move to"),
     (re.compile(r"^pick up\b"), "pick up from"),
     (re.compile(r"^place .+ on .+ next to\b"), "place on next to"),
+    (re.compile(r"^place .+ in .+ next to\b"), "place in next to"),
+    (re.compile(r"^place .+ under\b"), "place under"),
     (re.compile(r"^place .+ in\b"), "place in"),
     (re.compile(r"^place .+ on\b"), "place on"),
     (re.compile(r"^push .+ to\b"), "push to"),
     (re.compile(r"^turn .+ to\b"), "turn to"),
     (re.compile(r"^sweep .+ off\b"), "sweep off"),
+    # bgdata.operators.TEXT: sweep surface = "sweep {?r} with {?o}", wipe hard = "wipe {?r} with {?o}"
+    (re.compile(r"^sweep .+ with\b"), "sweep surface"),
+    (re.compile(r"^wipe .+ with\b"), "wipe hard"),
 )
 
 
