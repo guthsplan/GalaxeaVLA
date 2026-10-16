@@ -62,6 +62,12 @@ def test_skill_weights_for_groups_drop_unknown_labels():
     ("sweep half_log_176_0 and half_log_176_1 off driveway_umalys_0", "sweep off"),
     ("sweep surface table_1 brush_2", "sweep surface"),
     ("wipe hard table_1 rag_2", "wipe hard"),
+    # the training labels (bgdata.operators.TEXT): "sweep {?r} with {?o}", "wipe {?r} with {?o}"
+    ("sweep floors_ghetev_0 with broom_1", "sweep surface"),
+    ("wipe trumpet_1 with scrub_brush_2", "wipe hard"),
+    ("wipe trowel_1 and scraper_2 with steel_wool_3", "wipe hard"),
+    ("place mat_1 under table_2", "place under"),
+    ("place apple_1 in bowl_2 next to cup_3", "place in next to"),
 ])
 def test_skill_from_subtask_renderings(text, skill):
     assert skill_from_subtask(text) == skill
